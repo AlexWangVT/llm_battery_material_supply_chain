@@ -1,17 +1,21 @@
 import os
 import torch
+import datetime
 import requests
 import weaviate
 import asyncio
+import datetime
 import accelerate
-from bs4 import BeautifulSoup 
-from datetime import datetime
+from uuid import uuid4
 import streamlit as st
+from bs4 import BeautifulSoup 
+import weaviate.classes as wvc
+from weaviate.classes.query import Filter
 from dotenv import load_dotenv
 from pymongo import MongoClient
 from datasets import Dataset
 from langchain.schema import Document
-from urllib.parse import urlparse, unquote
+from urllib.parse import urlparse, unquote, urljoin
 from langchain.vectorstores import Weaviate
 from weaviate.connect import ConnectionParams
 from langchain.document_loaders import WebBaseLoader
