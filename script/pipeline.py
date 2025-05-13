@@ -1,116 +1,77 @@
 import os
-from langchain.document_loaders import WebBaseLoader
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.embeddings import HuggingFaceEmbeddings
-from langchain.vectorstores import Weaviate
-from pymongo import MongoClient
+import torch
+import requests
 import weaviate
+import asyncio
+import accelerate
+from bs4 import BeautifulSoup 
+from datetime import datetime
+import streamlit as st
+from dotenv import load_dotenv
+from pymongo import MongoClient
 from datasets import Dataset
-from transformers import AutoTokenizer, AutoModelForCausalLM, TrainingArguments, Trainer, DataCollatorForLanguageModeling
+from langchain.schema import Document
+from urllib.parse import urlparse, unquote
+from langchain.vectorstores import Weaviate
+from weaviate.connect import ConnectionParams
+from langchain.document_loaders import WebBaseLoader
 from peft import get_peft_model, LoraConfig, TaskType
-from langchain.document_loaders import MongoDBLoader
+from langchain.agents import Tool, initialize_agent
+from langchain.agents.agent_types import AgentType
+from langchain_community.tools import DuckDuckGoSearchRun
+from langchain_huggingface import HuggingFacePipeline 
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_community.document_loaders.mongodb import MongodbLoader
+from langchain_community.document_loaders import WebBaseLoader
+from langchain_community.tools import DuckDuckGoSearchRun, DuckDuckGoSearchResults 
+from langchain_community.document_loaders import UnstructuredURLLoader, UnstructuredPDFLoader, PyPDFLoader
+from weaviate.collections.classes.config import CollectionConfig, Property, DataType, VectorizerConfig
+from transformers import AutoTokenizer, AutoModelForCausalLM, TrainingArguments, Trainer, DataCollatorForLanguageModeling, pipeline
 
-# === Step 1: Ingest Raw Data ===
-url = "https://example.com/article"
-loader = WebBaseLoader(url)
-documents = loader.load()
+load_dotenv()
 
-# === Step 2: Store Raw Data in MongoDB ===
-mongo_client = MongoClient("mongodb://localhost:27017/")
-raw_collection = mongo_client["domain"]["raw_documents"]
-for doc in documents:
-    raw_collection.insert_one({"content": doc.page_content, "metadata": doc.metadata})
 
-# === Step 3: Retrieve Raw Data from MongoDB ===
+def search_data(local_data_sources):
+    with open(local_data_sources, "r") as file:
+        lines = file.readlines()
+        for line in lines:
+            if ".pdf" not in line: # Load web articles
+                loader = WebBaseLoader(line)
+                documents = loader.load()
+            else:
+                loader = PyPDFLoader(line) # Load pdf files local or online
+                async def load_pages():
+                    pages = []
+                    async for page in loader.alazy_load():
+                        pages.append(page)
+                    return pages
+                pages = asyncio.run(load_pages())
+                documents = "\n".join([p.page_content for p in pages])
+                metadata = pages[0].metadata if pages else {}
+    return documents
 
-loader = MongoDBLoader(
-    connection_string="mongodb://localhost:27017/",
-    db_name="domain",
-    collection_name="raw_documents",
-    content_field="content"
-)
-docs = loader.load()
 
-# === Step 4: Chunk the Text ===
-splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overplap=50)
-chunks = splitter.split_documents(docs)
+    
+    
+    print(f"{pages[0].metadata}\n")
+    print(pages[0].page_content) 
 
-# === Step 5: Generate Embeddings ===
-embedding_model = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
 
-# === Step 6: Store Embeddings in Weaviate ===
-weaviate_client = weaviate.Client("http://localhost:8080")
-vectorstore = Weaviate(
-    client=weaviate_client,
-    index_name="DomainChunks",
-    text_key="text",
-    embedding=embedding_model
-)
-vectorstore.add_documents(chunks)
+def llm_model(model_name, token):
+    # Use defined Langchain agent to search documents automatically
+    # The agent is combined search tool with a LLM
+    tokenizer = AutoTokenizer.from_pretrained(model_name, token=token)
+    model = AutoModelForCausalLM.from_pretrained(model_name, trust_remote_code=True, device_map="auto",  # Automatically use GPU if available
+                                                    torch_dtype=torch.float16, token=token)
+    pipe = pipeline("text-generation", model=model, tokenizer=tokenizer, max_new_tokens=256) 
+    llm = HuggingFacePipeline(pipeline=pipe)
 
-# === Step 7: Prepare Data for LLaMA2 Fine-Tuning ===
-# Convert to instruction format for SFT
-def format_example(chunk):
-    return {
-        "instruction": "Summarize the following:",
-        "input": chunk.page_content,
-        "output": chunk.page_content[:250] + "..."  # Dummy response
-    }
+    return llm
 
-formatted_data = [format_example(doc) for doc in chunks]
-hf_dataset = Dataset.from_list(formatted_data)
 
-# === Load Tokenizer and Model ===
-model_name = "meta-llama/Llama-2-7b-hf"
-tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
-tokenizer.pad_token = tokenizer.eos_token
 
-model = AutoModelForCausalLM.from_pretrained(
-    model_name,
-    load_in_8bit=True,
-    device_map="auto"
-)
-
-# === Apply LoRA for Efficient Training ===
-lora_config = LoraConfig(
-    r=8,
-    lora_alpha=16,
-    target_modules=["q_proj", "v_proj"],
-    lora_dropout=0.05,
-    bias="none",
-    task_type=TaskType.CAUSAL_LM
-)
-model = get_peft_model(model, lora_config)
-
-# === Tokenize ===
-def tokenize(example):
-    prompt = f"### Instruction:\n{example['instruction']}\n### Input:\n{example['input']}\n### Response:\n{example['output']}"
-    tokens = tokenizer(prompt, padding="max_length", truncation=True, max_length=512)
-    tokens["labels"] = tokens["input_ids"].copy()
-    return tokens
-
-tokenized_dataset = hf_dataset.map(tokenize)
-
-# === Training Arguments and Trainer ===
-training_args = TrainingArguments(
-    output_dir="./llama2-finetuned",
-    per_device_train_batch_size=2,
-    gradient_accumulation_steps=4,
-    warmup_steps=100,
-    max_steps=300,
-    learning_rate=2e-4,
-    logging_steps=10,
-    save_steps=100,
-    fp16=True,
-    report_to="none"
-)
-
-trainer = Trainer(
-    model=model,
-    args=training_args,
-    train_dataset=tokenized_dataset,
-    data_collator=DataCollatorForLanguageModeling(tokenizer, mlm=False)
-)
-
-# === Fine-Tune the Model ===
-trainer.train()
+api_key = os.getenv("LLaMA_API_KEY")
+model_name = "meta-llama/Llama-2-7b-chat-hf"
+local_data_sources = "../data_sources/webpages.txt"
+llm = llm_model(model_name, api_key)

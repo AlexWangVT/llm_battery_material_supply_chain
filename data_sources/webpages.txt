@@ -1,0 +1,2 @@
+https://python.langchain.com/docs/how_to/document_loader_pdf/
+https://jessvb.github.io/assets/pdf/Autonomous_Vehicles_Tech_Today_Tomorrow.pdf

@@ -1,2 +1,4 @@
 /.venv3.12
 /huggingface_token
+.env
+/models
