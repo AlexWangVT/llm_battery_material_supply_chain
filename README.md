@@ -97,3 +97,15 @@ ii. run the following query to see the data stored in Weaviate. Here is just an 
   }
 }
 </pre>
+
+iv. open weaviate and altair (altair is a user-friendly tool to check data query in Weaviate)
+Input the code below in your terminal (where weaviate is installed) to connect Weaviate:
+```
+sudo docker-compose up
+```
+Execute the code below in your terminal (where weaviate is installed) to open Altair:
+```
+altair
+```
+
+### 1.2 Install packages
