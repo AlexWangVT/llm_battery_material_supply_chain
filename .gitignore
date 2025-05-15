@@ -1,3 +1,3 @@
 /.venv3.12
 .env
-/script/config.yml
+/script/*.yml
