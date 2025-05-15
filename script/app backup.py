@@ -1,27 +1,7 @@
-#################################################################################################
-# This section used to make sure "streamlit" and "torch" have no conflict 
-################################################################################################
-import sys
-import types
-
-# Create a fake module path to prevent Streamlit from trying to inspect torch.classes
-import torch
-
-# Monkey-patch torch.classes to trick Streamlit's watcher
-if not hasattr(torch.classes, "__path__"):
-    torch.classes.__path__ = []
-    torch.classes.__file__ = "torch_classes_stub.py"
-    torch.classes._is_streamlit_stub = True
-
-# Optionally: remove torch.classes from sys.modules to fully avoid inspection
-sys.modules["torch.classes"] = types.SimpleNamespace(__file__="torch_classes_stub.py", __path__=[])
-##################################################################################################
-
 import os
 os.environ["USER_AGENT"] = "battery_materials_supply_chain_app" # set up USER_AGENT environment to avoid user_agent warning
-import atexit
 import yaml
-# import torch
+import torch
 import datetime
 import requests
 import weaviate
@@ -63,17 +43,6 @@ user_agent = os.getenv("USER_AGENT", "battery_materials_supply_chain_app")
 with open("config.yml", "r") as f:
     config = yaml.safe_load(f)
 
-############################################################################
-# This section ensures mongodb and weaviate database close once at the end of the app run
-def cleanup_clients():
-    if "mongoclient" in st.session_state:
-        st.session_state.mongoclient.close()
-    if "weaviate_client" in st.session_state:
-        st.session_state.weaviate_client.close()
-
-atexit.register(cleanup_clients)
-############################################################################
-
 google_api_key = config["api"]["google_api"]
 llama_api_key = config["api"]["llama_api"]
 local_data_sources = config["database"]["local"]
@@ -91,28 +60,14 @@ gemini_model_name = config["model"]["gemini_model"]
 llama_model_name = config["model"]["llama_model"]
 
 
-
-def text_embedding_model_():      
-        model_name = text_embedding_model
-        model_kwargs = text_embedding_model_kwargs
-        encode_kwargs = {'normalize_embeddings': False}
-        hf = HuggingFaceEmbeddings(
-            model_name=model_name,
-            model_kwargs=model_kwargs,
-            encode_kwargs=encode_kwargs
-        )
-        return hf
-
-
-
 def crawl_nested_tabs(url, base_url, visited, max_depth, depth=0):
-    
     if url in visited or depth > max_depth:
         return []
 
     visited.add(url)
 
     try:
+
         headers = {
             "User-Agent": user_agent
         }
@@ -177,7 +132,7 @@ def mongodb(url, doc, metadata=None):
                 print("document exists!")
         else:
             mycol.insert_one(pdf_document)
-    
+       
     else:
         # insert web articles into mongodb
         insert_docu = {
@@ -201,25 +156,24 @@ def mongodb(url, doc, metadata=None):
 
 
 def search_load_data(local_data_sources):
-    
     with open(local_data_sources, "r") as file:
         lines = file.readlines()
+        session = requests.Session()
+        session.headers.update({"User-Agent": user_agent})
         for line in lines:
-            print(line)
             if not check_pdf_extension(line): # Load web articles
                 visited = set()
                 max_depth = 2  # Prevents infinite loops
                 all_tabs = crawl_nested_tabs(line, line, visited, max_depth)
                 for tab in all_tabs:
                     try: 
-                        loader = WebBaseLoader(tab)
-                        docs = loader.load()
-                        for doc in docs:
-                            mongodb(tab, doc)
+                        loader = WebBaseLoader(line, requests_session=session)
+                        doc = loader.load()
+                        mongodb(tab, doc)
                     except Exception as e:
                         print(f"Error loading {tab}: {e}")
             else:
-                loader = PyPDFLoader(line) # Load pdf files local or online
+                loader = PyPDFLoader(line, requests_session=session) # Load pdf files local or online
                 async def load_pages():
                     pages = []
                     async for page in loader.alazy_load():
@@ -229,6 +183,18 @@ def search_load_data(local_data_sources):
                 doc = "\n".join([p.page_content for p in pages])
                 metadata = pages[0].metadata if pages else {}
                 mongodb(line, doc, metadata)
+
+
+def text_embedding_model_():
+    model_name = text_embedding_model
+    model_kwargs = text_embedding_model_kwargs
+    encode_kwargs = {'normalize_embeddings': False}
+    hf = HuggingFaceEmbeddings(
+        model_name=model_name,
+        model_kwargs=model_kwargs,
+        encode_kwargs=encode_kwargs
+    )
+    return hf
 
 
 def text_split_embedding():
@@ -323,82 +289,43 @@ def weaviate_data_query():
                 print("Inserted new object.")
 
 
-def data_processing():
-    search_load_data(local_data_sources)
-    weaviate_data_query()
+def gemini_model(model_name, api_key):
+    # Configure the API
+    genai.configure(api_key = api_key)
+    # Load the Gemini model
+    gmodel = genai.GenerativeModel(model_name)
+    return gmodel
 
 
-def question_and_answers(query_question):
-    def gemini_model(model_name, api_key):
-        # Configure the API
-        genai.configure(api_key = api_key)
-        # Load the Gemini model
-        gmodel = genai.GenerativeModel(model_name)
-        return gmodel
+def main():   
+        
+    model = gemini_model(gemini_model_name, google_api_key)
+    # Ask a question
+    query_question = 'Which sensors are currently used in prominent research and commercial vehicles?'
+    hf = text_embedding_model_()
+    query_vector = hf.embed_query(query_question)
+    collection = weaviate_client.collections.get(weaviate_collection_name)
+    results = collection.query.near_vector(query_vector, limit=10)
+    retrieved_chunks = [obj.properties["content"] for obj in results.objects]
 
+    # Gemini prompt
+    context = "\n".join(retrieved_chunks)
+    prompt = f"""Answer the question using the following context:
 
-    def question_query(query_question):   
-            
-        model = gemini_model(gemini_model_name, google_api_key)
-        # Ask a question
-        # query_question = 'Which sensors are currently used in prominent research and commercial vehicles?'
-        hf = text_embedding_model_()
-        query_vector = hf.embed_query(query_question)
-        collection = weaviate_client.collections.get(weaviate_collection_name)
-        results = collection.query.near_vector(query_vector, limit=10)
-        retrieved_chunks = [obj.properties["content"] for obj in results.objects]
+    Context:
+    {context}
 
-        # Gemini prompt
-        context = "\n".join(retrieved_chunks)
-        prompt = f"""Answer the question using the following context:
+    Question:
+    {query_question}
 
-        Context:
-        {context}
+    Answer:"""
+    response = model.generate_content(prompt)
+    # Print the response
+    print("Answer:")
+    print(response.text)
 
-        Question:
-        {query_question}
-
-        Answer:"""
-        response = model.generate_content(prompt)
-        return response.text
-    return question_query(query_question)
-
-
-def main():
-    st.set_page_config(page_title="Battery Materials Q&A", layout="centered")
-    st.title("🔋 Battery Materials Supply Chain")
-
-    # Sidebar or top dropdown for selecting mode
-    mode = st.selectbox("Select Mode", ["💼 Data Processing Mode", "💬 Q&A Mode"])
-
-    if mode == "💼 Data Processing Mode":
-        st.subheader("Run Data Ingestion and Embedding")
-
-        if st.button("Run Data Pipeline"):
-            with st.spinner("Processing data..."):
-                try:
-                    data_processing()
-                except Exception as e:
-                    st.error(f"⚠️ Error: {e}")
-                    
-    elif mode == "💬 Q&A Mode":
-        st.subheader("Ask a Question")
-        query = st.text_input("Enter your question")
-        if st.button("Get Answer"):
-            if not query.strip():
-                st.warning("Please enter a question.")
-            else:
-                with st.spinner("Querying the model..."):
-                    try:
-                        answers = question_and_answers(query)
-                        st.markdown("### 🧠 Answer:")
-                        st.write(answers or "Gemini returned no response.")
-                    except Exception as e:
-                        st.error(f"⚠️ Error: {e}")
-
-    # mongoclient.close()
-    # weaviate_client.close()
-    
+    mongoclient.close()
+    weaviate_client.close()
 
 
 if __name__ == "__main__":
