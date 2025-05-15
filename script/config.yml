@@ -1,4 +1,4 @@
-# This is the config file for app run and backend data process
+# This is the config file 
 api:
   google_api: AIzaSyCTTyg1KoU8kBEQ-YiCa9RKT7YWz7t-Ons
   llama_api: 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
