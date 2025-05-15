@@ -1,0 +1,18 @@
+api:
+  google_api: AIzaSyCTTyg1KoU8kBEQ-YiCa9RKT7YWz7t-Ons
+  llama_api: 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
+
+database:
+  local: "../data_sources/webpages.txt"
+  mongodb_server: "mongodb://localhost:27017/"
+  mongodb_database: "test_db"
+  mongodb_collection_name: "test1"
+  weaviate_db_server: "connect to local temporarily"
+  weaviate_collection_name: "Supply_chain_material"
+  weaviate_similarity_factor: 0.99
+
+model:
+  text_embedding_model: "sentence-transformers/all-mpnet-base-v2"
+  text_embedding_model_kwargs: {'device': 'cpu'}
+  gemini_model: "models/gemini-1.5-flash"
+  llama_model: "meta-llama/Llama-2-7b-chat-hf"
