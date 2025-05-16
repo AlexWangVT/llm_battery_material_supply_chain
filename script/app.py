@@ -1,6 +1,6 @@
-#################################################################################################
-# This section used to make sure "streamlit" and "torch" have no conflict 
-################################################################################################
+###########################################################################################################
+# This section used to make sure "streamlit" and "torch" have no conflict, must put at the top of this app
+###########################################################################################################
 import sys
 import types
 
@@ -21,7 +21,8 @@ import os
 os.environ["USER_AGENT"] = "battery_materials_supply_chain_app" # set up USER_AGENT environment to avoid user_agent warning
 import atexit
 import yaml
-# import torch
+import nltk
+import string
 import datetime
 import requests
 import weaviate
@@ -32,6 +33,7 @@ from uuid import uuid4
 import streamlit as st
 from bs4 import BeautifulSoup 
 import weaviate.classes as wvc
+from nltk.corpus import stopwords
 import google.generativeai as genai
 from weaviate.classes.query import Filter
 from dotenv import load_dotenv
@@ -60,6 +62,11 @@ from transformers import AutoTokenizer, AutoModelForCausalLM, TrainingArguments,
 load_dotenv(dotenv_path="../.env")
 user_agent = os.getenv("USER_AGENT", "battery_materials_supply_chain_app")
 
+try:
+    stopwords.words('english')
+except LookupError:
+    nltk.download('stopwords')
+
 with open("config.yml", "r") as f:
     config = yaml.safe_load(f)
 
@@ -87,7 +94,14 @@ text_embedding_model = config["model"]["text_embedding_model"]
 text_embedding_model_kwargs = config["model"]["text_embedding_model_kwargs"]
 gemini_model_name = config["model"]["gemini_model"]
 llama_model_name = config["model"]["llama_model"]
-
+english_stopwords = set(stopwords.words("english"))
+chinese_stopwords = {"的", "了", "和", "是", "我", "不", "在", "有", "就", "人", "都", "一", "一个", "上", "也", "很", "到", "说", "要",
+                    "去", "你", "会", "着", "没有", "看", "好", "自己", "这", "那", "它", "他", "她", "我们", "你们", "他们", "她们",
+                    "它们", "与", "而", "但", "如果", "因为", "所以", "虽然", "但是", "或者", "即使", "那么", "这样", "那么", "而且",
+                    "对", "从", "当", "在", "与", "比", "对比", "比起", "不如", "如", "如同", "同样", "一样", "更", "最", "多", "少",
+                    "很", "太", "非常", "极", "极其", "相当", "几乎", "大约", "差不多", "差不多", "左右", "大概", "大约", "约", "将近",
+                    "几", "些", "每", "所有", "全部", "一切", "任何", "某", "某些", "某个", "某些", "某种", "某些", "某类", "某种",
+                    "其", "其余", "其余的", "其余的", "其他", "其他的", "其他人"}
 
 
 def text_embedding_model_():      
@@ -268,6 +282,7 @@ def text_split_embedding(start_date, end_date):
 
 
 def weaviate_data_query(start_date, end_date):
+
     # Check if collection/class already exists, create one if not exists
     existing_collections = weaviate_client.collections.list_all()
     if weaviate_collection_name not in existing_collections:
@@ -291,33 +306,55 @@ def weaviate_data_query(start_date, end_date):
     
     split_docs, text_embeddings = text_split_embedding(start_date, end_date)
 
+    # is_valid_query used to avoid stop words error
+    def is_valid_query(text: str) -> bool:
+        # Remove punctuation and lowercase the query
+        print(f"🧪 Checking query: {text[:60]}...") 
+        if not text or text.strip() == "":
+            print("⚠️ Text is empty or whitespace only.")
+            return False
+        
+        cleaned = text.translate(str.maketrans('', '', string.punctuation)).strip().lower()
+        words = set(cleaned.split())
+        chinese_chars = set(c for c in cleaned if c in chinese_stopwords)
+        english_words = words - english_stopwords
+        is_valid = bool(english_words or chinese_chars)
+        print(f"✅ is_valid_query result: {is_valid}")
+        return is_valid
+    
         # Store documents and vectors
     for doc, vector in zip(split_docs, text_embeddings):
+        if not is_valid_query(doc.page_content):
+            print((f"⚠️ Skipped doc: Only stopwords or too short.\nContent: {doc.page_content[:200]}"))
+            continue
         # 1. Check if exact content already exists
-        existing = weaviate_client.collections.get("Supply_chain_material").query.fetch_objects(
-            filters=Filter.by_property("content").equal(doc.page_content),
-            return_properties=["content"]
-        )
-
-        if existing.objects:
-            print("Exact content already exists. No action taken.")
-        else:
-            similar = weaviate_client.collections.get("Supply_chain_material").query.near_vector(
-                near_vector=vector,
-                certainty=weaviate_similarity_factor,
+        try: 
+            existing = weaviate_client.collections.get("Supply_chain_material").query.fetch_objects(
+                filters=Filter.by_property("content").equal(doc.page_content),
                 return_properties=["content"]
             )
 
-            if similar.objects:
-                print("Similar vector exists. No action taken.")
+            if existing.objects:
+                print("Exact content already exists. No action taken.")
             else:
-                # Insert new object
-                weaviate_client.collections.get("Supply_chain_material").data.insert(
-                    properties={"content": doc.page_content},
-                    vector=vector,
-                    uuid = uuid4()
+                similar = weaviate_client.collections.get("Supply_chain_material").query.near_vector(
+                    near_vector=vector,
+                    certainty=weaviate_similarity_factor,
+                    return_properties=["content"]
                 )
-                print("Insert new data successfully!")
+
+                if similar.objects:
+                    print("Similar vector exists. No action taken.")
+                else:
+                    # Insert new object
+                    weaviate_client.collections.get("Supply_chain_material").data.insert(
+                        properties={"content": doc.page_content},
+                        vector=vector,
+                        uuid = uuid4()
+                    )
+                    print("Insert new data successfully!")
+        except Exception as e:
+            print(f"⚠️ Problematic content: {doc.page_content}")
     st.write("Data successfully stored in Weaviate!")
     
 
@@ -371,7 +408,7 @@ def main():
     st.title("🔋 Battery Materials Supply Chain")
 
     # Sidebar or top dropdown for selecting mode
-    mode = st.selectbox("Select Mode", ["💼 Data Processing Mode", "💬 Q&A Mode", "🛠️ Model Finetuning"])
+    mode = st.selectbox("Select Mode", ["💬 Q&A Mode", "💼 Data Processing Mode", "🛠️ Model Finetuning"])
     # Specify the date range for data updating
     default_start = datetime.datetime(2025, 5, 1)
     default_end = datetime.datetime(2025, 5, 17)
