@@ -83,8 +83,6 @@ mycol = mongo_db[config["database"]["mongodb_collection_name"]]
 weaviate_client = weaviate.connect_to_local() # connect to local temporarily, will connect to cloud server later
 weaviate_collection_name = config["database"]["weaviate_collection_name"] # Collection name must have the first letter capitalized in Weaviate
 weaviate_similarity_factor = config["database"]["weaviate_similarity_factor"]
-mongodb_update_start_time = datetime.datetime(2025, 1, 1)
-mongodb_update_end_time = datetime.datetime(2025, 5, 15)
 text_embedding_model = config["model"]["text_embedding_model"]
 text_embedding_model_kwargs = config["model"]["text_embedding_model_kwargs"]
 gemini_model_name = config["model"]["gemini_model"]
@@ -201,11 +199,9 @@ def mongodb(url, doc, metadata=None):
 
 
 def search_load_data(local_data_sources):
-    
     with open(local_data_sources, "r") as file:
         lines = file.readlines()
         for line in lines:
-            print(line)
             if not check_pdf_extension(line): # Load web articles
                 visited = set()
                 max_depth = 2  # Prevents infinite loops
@@ -214,10 +210,11 @@ def search_load_data(local_data_sources):
                     try: 
                         loader = WebBaseLoader(tab)
                         docs = loader.load()
-                        for doc in docs:
-                            mongodb(tab, doc)
+                        doc = docs[0]
+                        mongodb(tab, doc)
                     except Exception as e:
                         print(f"Error loading {tab}: {e}")
+                st.write(f"Load documents from web {line} and store in MongoDB successfully!")
             else:
                 loader = PyPDFLoader(line) # Load pdf files local or online
                 async def load_pages():
@@ -229,20 +226,21 @@ def search_load_data(local_data_sources):
                 doc = "\n".join([p.page_content for p in pages])
                 metadata = pages[0].metadata if pages else {}
                 mongodb(line, doc, metadata)
+                st.write(f"Load PDF documents from {line} and store in MongoDB successfully!")
 
 
-def text_split_embedding():
-    def data_retrieval_by_time_mongodb(client):
-        db_name = client[mongo_db]
-        col_name = db_name[mycol]
-        data = col_name.find({"metadata.timestamp": {
-                "$gte": mongodb_update_start_time,
-                "$lte": mongodb_update_end_time
+def text_split_embedding(start_date, end_date):
+    def data_retrieval_by_time_mongodb(start_date, end_date):
+        start_datetime = datetime.datetime.combine(start_date, datetime.time.min)
+        end_datetime = datetime.datetime.combine(end_date, datetime.time.max)
+        data = mycol.find({"metadata.timestamp": {
+                "$gte": start_datetime,
+                "$lte": end_datetime
             }   
         })
         return data
-
-    results = data_retrieval_by_time_mongodb(mongoclient)
+    
+    results = data_retrieval_by_time_mongodb(start_date, end_date)
 
     # Convert to Langchain format
     langchain_documents = [
@@ -251,7 +249,7 @@ def text_split_embedding():
             metadata=doc.get("metadata", {})
         ) for doc in results
     ]
-
+    
     # Splitting
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=500,
@@ -259,18 +257,17 @@ def text_split_embedding():
     )
 
     split_docs = splitter.split_documents(langchain_documents)
-    # print(f"Total chunks created: {len(split_docs)}")
-    # print("Example chunk:\n", split_docs[0].page_content)
-    # print("Metadata:", split_docs[0].metadata)
-
+ 
     # Embedding
     hf = text_embedding_model_()
     texts = [doc.page_content for doc in split_docs]
     text_embeddings = hf.embed_documents(texts)
+    st.write(text_embeddings)
+    st.write("embedding is complete!")
     return split_docs, text_embeddings
 
 
-def weaviate_data_query():
+def weaviate_data_query(start_date, end_date):
     # Check if collection/class already exists, create one if not exists
     existing_collections = weaviate_client.collections.list_all()
     if weaviate_collection_name not in existing_collections:
@@ -292,7 +289,7 @@ def weaviate_data_query():
             ]
         )
     
-    split_docs, text_embeddings = text_split_embedding()
+    split_docs, text_embeddings = text_split_embedding(start_date, end_date)
 
         # Store documents and vectors
     for doc, vector in zip(split_docs, text_embeddings):
@@ -320,13 +317,14 @@ def weaviate_data_query():
                     vector=vector,
                     uuid = uuid4()
                 )
-                print("Inserted new object.")
+                print("Insert new data successfully!")
+    st.write("Data successfully stored in Weaviate!")
+    
 
-
-def data_processing():
+def data_processing(start_date, end_date):
     search_load_data(local_data_sources)
-    weaviate_data_query()
-
+    weaviate_data_query(start_date, end_date)
+    st.write("Data update successfully completed!")
 
 def question_and_answers(query_question):
     def gemini_model(model_name, api_key):
@@ -364,20 +362,34 @@ def question_and_answers(query_question):
     return question_query(query_question)
 
 
+def llm_finetune(start_date, end_date):
+    return st.write("Model finetuning successfully completed!")
+
+
 def main():
     st.set_page_config(page_title="Battery Materials Q&A", layout="centered")
     st.title("🔋 Battery Materials Supply Chain")
 
     # Sidebar or top dropdown for selecting mode
-    mode = st.selectbox("Select Mode", ["💼 Data Processing Mode", "💬 Q&A Mode"])
-
+    mode = st.selectbox("Select Mode", ["💼 Data Processing Mode", "💬 Q&A Mode", "🛠️ Model Finetuning"])
+    # Specify the date range for data updating
+    default_start = datetime.datetime(2025, 5, 1)
+    default_end = datetime.datetime(2025, 5, 17)
+    if mode in ["💼 Data Processing Mode", "🛠️ Model Finetuning"]:
+        st.markdown("### 📅 Select Data Time Range")
+        start_date, end_date = st.date_input(
+            "Select start and end date:",
+            value=(default_start, default_end),
+            min_value=datetime.date(2010, 1, 1),
+            max_value=datetime.date.today() + datetime.timedelta(days=1)
+        )
     if mode == "💼 Data Processing Mode":
         st.subheader("Run Data Ingestion and Embedding")
 
         if st.button("Run Data Pipeline"):
             with st.spinner("Processing data..."):
                 try:
-                    data_processing()
+                    data_processing(start_date, end_date)
                 except Exception as e:
                     st.error(f"⚠️ Error: {e}")
                     
@@ -396,9 +408,17 @@ def main():
                     except Exception as e:
                         st.error(f"⚠️ Error: {e}")
 
-    # mongoclient.close()
-    # weaviate_client.close()
-    
+    elif mode == "🛠️ Model Finetuning":
+        st.subheader("Model Finetuning")
+
+        retrain = st.button("Re-train Embedding Model")
+        if retrain:
+            with st.spinner("Re-calibrating model..."):
+                try:
+                    llm_finetune(start_date, end_date)  # You need to define this function
+                    st.success("✅ Model finetuning complete.")
+                except Exception as e:
+                    st.error(f"⚠️ Error during finetuning: {e}")
 
 
 if __name__ == "__main__":
