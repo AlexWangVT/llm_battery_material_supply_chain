@@ -363,7 +363,7 @@ def data_processing(start_date, end_date):
     weaviate_data_query(start_date, end_date)
     st.write("Data update successfully completed!")
 
-def question_and_answers(query_question):
+def question_and_answers(query_question, conversation_history):
     def gemini_model(model_name, api_key):
         # Configure the API
         genai.configure(api_key = api_key)
@@ -372,31 +372,53 @@ def question_and_answers(query_question):
         return gmodel
 
 
-    def question_query(query_question):   
-            
+    def question_query(query_question, conversation_history):   
+        
         model = gemini_model(gemini_model_name, google_api_key)
         # Ask a question
-        # query_question = 'Which sensors are currently used in prominent research and commercial vehicles?'
+        if conversation_history:
+            last_question = conversation_history[-1][0]
+            combined_query = last_question + " " + query_question
+        else:
+            combined_query = query_question
+
         hf = text_embedding_model_()
-        query_vector = hf.embed_query(query_question)
+        query_vector = hf.embed_query(combined_query)
         collection = weaviate_client.collections.get(weaviate_collection_name)
         results = collection.query.near_vector(query_vector, limit=10)
         retrieved_chunks = [obj.properties["content"] for obj in results.objects]
 
         # Gemini prompt
         context = "\n".join(retrieved_chunks)
-        prompt = f"""Answer the question using the following context:
 
-        Context:
+        # Build previous turns into the prompt
+        history_text = ""
+        for user_q, assistant_a in conversation_history[-3:]:  # limit to last 3 turns
+            history_text += f"User: {user_q}\nAssistant: {assistant_a}\n"
+
+        prompt = f"""
+        Use the provided context and your own general knowledge to answer the question. 
+        If the context contains relevant details, combine it with your own general knowledge to provide the best answer. 
+        If the context is missing details, supplement them using your own training and knowledge.
+        Also, the user may ask follow-up questions that depend on earlier conversation. 
+        Use the "Conversation History" below to maintain continuity and resolve such questions.
+
+        Current question:
+        {query_question}, not just based on context but on your general knowledge
+
+        Here's the Context:
         {context}
 
-        Question:
-        {query_question}
+        Conversion history:
+        {history_text}
 
         Answer:"""
-        response = model.generate_content(prompt)
+
+        # response = model.generate_content(prompt)
+        response = model.generate_content([{"role": "user", "parts": [prompt]}])
+
         return response.text
-    return question_query(query_question)
+    return question_query(query_question, conversation_history)
 
 
 def llm_finetune(start_date, end_date):
@@ -432,6 +454,9 @@ def main():
                     
     elif mode == "💬 Q&A Mode":
         st.subheader("Ask a Question")
+        if "conversation_history" not in st.session_state:
+            st.session_state.conversation_history = []
+
         query = st.text_input("Enter your question")
         if st.button("Get Answer"):
             if not query.strip():
@@ -439,9 +464,17 @@ def main():
             else:
                 with st.spinner("Querying the model..."):
                     try:
-                        answers = question_and_answers(query)
+                        answers = question_and_answers(query, st.session_state.conversation_history)
+                        st.session_state.conversation_history.append((query, answers))  # <-- Maintain conversation
                         st.markdown("### 🧠 Answer:")
                         st.write(answers or "Gemini returned no response.")
+
+                        # Show chat history (optional)
+                        with st.expander("🗂️ Conversation History"):
+                            for user_q, assistant_a in st.session_state.conversation_history:
+                                st.markdown(f"**User:** {user_q}")
+                                st.markdown(f"**Assistant:** {assistant_a}")
+
                     except Exception as e:
                         st.error(f"⚠️ Error: {e}")
 
