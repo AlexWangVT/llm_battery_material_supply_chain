@@ -360,6 +360,7 @@ def weaviate_data_query(start_date, end_date):
 
 def data_processing(start_date, end_date):
     search_load_data(local_data_sources)
+    st.write("Data search and load successfully completed!")
     weaviate_data_query(start_date, end_date)
     st.write("Data update successfully completed!")
 
