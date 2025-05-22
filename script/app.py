@@ -102,7 +102,7 @@ chinese_stopwords = {"的", "了", "和", "是", "我", "不", "在", "有", "�
                     "很", "太", "非常", "极", "极其", "相当", "几乎", "大约", "差不多", "差不多", "左右", "大概", "大约", "约", "将近",
                     "几", "些", "每", "所有", "全部", "一切", "任何", "某", "某些", "某个", "某些", "某种", "某些", "某类", "某种",
                     "其", "其余", "其余的", "其余的", "其他", "其他的", "其他人"}
-
+near_vector_limit = 30
 
 def text_embedding_model_():      
         model_name = text_embedding_model
@@ -386,7 +386,7 @@ def question_and_answers(query_question, conversation_history):
         hf = text_embedding_model_()
         query_vector = hf.embed_query(combined_query)
         collection = weaviate_client.collections.get(weaviate_collection_name)
-        results = collection.query.near_vector(query_vector, limit=10)
+        results = collection.query.near_vector(query_vector, limit=near_vector_limit)
         retrieved_chunks = [obj.properties["content"] for obj in results.objects]
 
         # Gemini prompt
