@@ -19,6 +19,7 @@ sys.modules["torch.classes"] = types.SimpleNamespace(__file__="torch_classes_stu
 
 import os
 os.environ["USER_AGENT"] = "battery_materials_supply_chain_app" # set up USER_AGENT environment to avoid user_agent warning
+import glob
 import atexit
 import yaml
 import nltk
@@ -58,7 +59,7 @@ from langchain_community.document_loaders import UnstructuredURLLoader, Unstruct
 from weaviate.collections.classes.config import CollectionConfig, Property, DataType, VectorizerConfig
 from transformers import AutoTokenizer, AutoModelForCausalLM, TrainingArguments, Trainer, DataCollatorForLanguageModeling, pipeline
 
-
+############################################################################
 load_dotenv(dotenv_path="../.env")
 user_agent = os.getenv("USER_AGENT", "battery_materials_supply_chain_app")
 
@@ -80,10 +81,11 @@ def cleanup_clients():
 
 atexit.register(cleanup_clients)
 ############################################################################
-
+# Define environment
 google_api_key = config["api"]["google_api"]
 llama_api_key = config["api"]["llama_api"]
-local_data_sources = config["database"]["local"]
+online_data_sources = config["database"]["online"]
+local_pdf_database = config["database"]["local_pdf"]
 mongoclient = MongoClient(config["database"]["mongodb_server"])
 mongo_db = mongoclient[config["database"]["mongodb_database"]]
 mycol = mongo_db[config["database"]["mongodb_collection_name"]]
@@ -114,7 +116,6 @@ def text_embedding_model_():
             encode_kwargs=encode_kwargs
         )
         return hf
-
 
 
 def crawl_nested_tabs(url, base_url, visited, max_depth, depth=0):
@@ -158,6 +159,10 @@ def check_pdf_extension(file_or_link):
         return file_or_link.lower().endswith(".pdf")
 
 
+def is_pdf_already_loaded(path, mycol):
+        return mycol.count_documents({"source": path}) > 0
+
+
 def mongodb(url, doc, metadata=None):
     def generate_title_from_url(url: str) -> str:
         path = urlparse(url).path
@@ -180,13 +185,15 @@ def mongodb(url, doc, metadata=None):
                 }
             }
         # insert pdf into mongodb
+        # If existing_doc condition is another check about if the pdf is already loaded or not by checking the content of the pdf document. 
+        # This second-level check aims to avoid the issue resulted from the is_pdf_already_loaded function when the source has some special symbol like "\n"
         existing_doc = mycol.find_one({"metadata.source": pdf_document["metadata"]["source"]})
         if existing_doc:
             if existing_doc.get("content", "") != pdf_document['content']:
                 mycol.replace_one({"_id": existing_doc["_id"]}, pdf_document)
-                print("documents updated!")
+                print(f"{url} documents updated!")
             else:
-                print("document exists!")
+                print(f"{url} document exists!")
         else:
             mycol.insert_one(pdf_document)
     
@@ -205,31 +212,41 @@ def mongodb(url, doc, metadata=None):
         if existing_doc:
             if existing_doc.get("content", "") != insert_docu['content']:
                 mycol.replace_one({"_id": existing_doc["_id"]}, insert_docu)
-                print("documents updated!")
+                print(f"{url} documents updated!")
             else:
-                print("document exists!")
+                print(f"{url} document exists!")
         else:
             mycol.insert_one(insert_docu)
 
 
-def search_load_data(local_data_sources):
-    with open(local_data_sources, "r") as file:
-        lines = file.readlines()
-        for line in lines:
-            if not check_pdf_extension(line): # Load web articles
-                visited = set()
-                max_depth = 2  # Prevents infinite loops
-                all_tabs = crawl_nested_tabs(line, line, visited, max_depth)
-                for tab in all_tabs:
-                    try: 
-                        loader = WebBaseLoader(tab)
-                        docs = loader.load()
-                        doc = docs[0]
-                        mongodb(tab, doc)
-                    except Exception as e:
-                        print(f"Error loading {tab}: {e}")
-                st.write(f"Load documents from web {line} and store in MongoDB successfully!")
-            else:
+def search_load_data(online_data_sources, local_pdf_database):
+    with open(online_data_sources, "r") as file:
+        # lines = file.readlines()
+        web_sources = [line.strip() for line in file.readlines() if line.strip()]
+
+    pdf_sources = glob.glob(os.path.join(local_pdf_database, "*.pdf"))
+    lines = web_sources + pdf_sources    
+
+    for line in lines:     
+        if not check_pdf_extension(line): # Load web articles
+            visited = set()
+            max_depth = 2  # Prevents infinite loops
+            all_tabs = crawl_nested_tabs(line, line, visited, max_depth)
+            for tab in all_tabs:
+                try: 
+                    loader = WebBaseLoader(tab)
+                    docs = loader.load()
+                    doc = docs[0]
+                    mongodb(tab, doc)
+                except Exception as e:
+                    print(f"Error loading {tab}: {e}")
+            st.write(f"Load documents from web {line} and store in MongoDB successfully!")
+        else:
+            if is_pdf_already_loaded(line, mycol):
+                print(f"Skipped (already in DB): {line}")
+                continue 
+            
+            try:
                 loader = PyPDFLoader(line) # Load pdf files local or online
                 async def load_pages():
                     pages = []
@@ -240,7 +257,9 @@ def search_load_data(local_data_sources):
                 doc = "\n".join([p.page_content for p in pages])
                 metadata = pages[0].metadata if pages else {}
                 mongodb(line, doc, metadata)
-                st.write(f"Load PDF documents from {line} and store in MongoDB successfully!")
+            except Exception as e:
+                print(f"Error loading {line}: {e}")
+            st.write(f"Load PDF documents from {line} and store in MongoDB successfully!")
 
 
 def text_split_embedding(start_date, end_date):
@@ -276,7 +295,6 @@ def text_split_embedding(start_date, end_date):
     hf = text_embedding_model_()
     texts = [doc.page_content for doc in split_docs]
     text_embeddings = hf.embed_documents(texts)
-    st.write(text_embeddings)
     st.write("embedding is complete!")
     return split_docs, text_embeddings
 
@@ -359,7 +377,7 @@ def weaviate_data_query(start_date, end_date):
     
 
 def data_processing(start_date, end_date):
-    search_load_data(local_data_sources)
+    search_load_data(online_data_sources, local_pdf_database)
     st.write("Data search and load successfully completed!")
     weaviate_data_query(start_date, end_date)
     st.write("Data update successfully completed!")
@@ -403,6 +421,7 @@ def question_and_answers(query_question, conversation_history):
         If the context is missing details, supplement them using your own training and knowledge.
         Also, the user may ask follow-up questions that depend on earlier conversation. 
         Use the "Conversation History" below to maintain continuity and resolve such questions.
+        Be sure you are able to search, reason, and summarize information from different documents for the same company and site.
 
         Current question:
         {query_question}, not just based on context but on your general knowledge
@@ -437,12 +456,19 @@ def main():
     default_end = datetime.datetime(2025, 5, 17)
     if mode in ["💼 Data Processing Mode", "🛠️ Model Finetuning"]:
         st.markdown("### 📅 Select Data Time Range")
-        start_date, end_date = st.date_input(
+        date_range = st.date_input(
             "Select start and end date:",
             value=(default_start, default_end),
             min_value=datetime.date(2010, 1, 1),
             max_value=datetime.date.today() + datetime.timedelta(days=1)
         )
+        # Only unpack when it's a tuple of two dates
+        if isinstance(date_range, tuple) and len(date_range) == 2:
+            start_date, end_date = date_range
+        else:
+            # Use defaults until user selects both dates
+            start_date, end_date = default_start, default_end
+
     if mode == "💼 Data Processing Mode":
         st.subheader("Run Data Ingestion and Embedding")
 
