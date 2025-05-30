@@ -23,6 +23,9 @@ import glob
 import atexit
 import yaml
 import nltk
+import fitz  # PyMuPDF for better PDF parsing
+import io
+import re
 import string
 import datetime
 import requests
@@ -30,6 +33,7 @@ import weaviate
 import asyncio
 import datetime
 import accelerate
+import unicodedata
 from uuid import uuid4
 import streamlit as st
 from bs4 import BeautifulSoup 
@@ -105,11 +109,14 @@ chinese_stopwords = {"的", "了", "和", "是", "我", "不", "在", "有", "�
                     "几", "些", "每", "所有", "全部", "一切", "任何", "某", "某些", "某个", "某些", "某种", "某些", "某类", "某种",
                     "其", "其余", "其余的", "其余的", "其他", "其他的", "其他人"}
 near_vector_limit = 30
+top_k_matching_vector = 10
+source_filter = None
+# ["../data_sources/local_pdfs/凯金——转让.pdf", "../data_sources/local_pdfs/贝特瑞-年度报告2023.pdf"] # This is used for testing purpose when we do not want to process all data, if all data need process, it equals None
 
 def text_embedding_model_():      
         model_name = text_embedding_model
         model_kwargs = text_embedding_model_kwargs
-        encode_kwargs = {'normalize_embeddings': False}
+        encode_kwargs = {'normalize_embeddings': True}
         hf = HuggingFaceEmbeddings(
             model_name=model_name,
             model_kwargs=model_kwargs,
@@ -163,6 +170,60 @@ def is_pdf_already_loaded(path, mycol):
         return mycol.count_documents({"source": path}) > 0
 
 
+def extract_tables_from_pdf_text(text):
+    """Extract tables using regex heuristics (or replace with Deep Learning model).
+    This will improve text embedding."""
+    lines = text.splitlines()
+    tables = []
+    current_table = []
+    for line in lines:
+        if re.search(r"\s{2,}", line):
+            current_table.append(line)
+        elif current_table:
+            tables.append("\n".join(current_table))
+            current_table = []
+    if current_table:
+        tables.append("\n".join(current_table))
+    return tables
+
+
+def extract_sections_from_text(text):
+    """Simple section labeling based on heading patterns. This will improve text embedding."""
+    section_heading_patterns = [
+                        r"(?i)^([ivxlcdm]+)[\.\)]\s+.+$",                      # Roman numerals: I. Introduction
+                        r"^(\d+(\.\d+)*[\.\)]?)\s+.+$",                        # Numeric: 1., 1.1, 1.2.3
+                        r"(?i)^(chapter|section)\s+\d+[\.:]?\s+.+$",           # Chapter/Section 1:
+                        r"^[A-Z\s]{5,}$",                                      # ALL CAPS headings
+                        r"^[a-zA-Z][\.\)]\s+.+$",                              # Alphabetic bullets: a), b.
+                        r"^\d+\s*[-–—]\s+.+$",                                 # Number - Title
+                        r"^[一二三四五六七八九十百千]+[、.．． ]+.+$",             # Chinese numbered: 一、二、三
+                        r"^[一二三四五六七八九十百千]+\.\d+[\s\.．]*.+$",         # Chinese numbered + sub: 一.1 方法
+                        r"^(引言|背景|方法|研究现状|文献综述|讨论|结论|展望|附录|致谢)$",  # Common Chinese headings
+                        r"^[（\(][一二三四五六七八九十百千]+[）\)]\s*.+$",         # Chinese bracket bullets: （一）
+                        r"^(\d+\.){1,}\d*\s+.+$",                              # 1.1.1 Subsections
+                        r"^\d+[:：]\s*.+$",                                    # 1：章节
+                    ]
+
+    def is_section_heading(text_line):
+        for pattern in section_heading_patterns:
+            if re.match(pattern, text_line.strip()):
+                return True
+        return False
+
+    sections = []
+    current = {"title": "Introduction", "content": ""}
+    for line in text.splitlines():
+        if is_section_heading(line):
+            if current["content"]:
+                sections.append(current)
+            current = {"title": line.strip(), "content": ""}
+        else:
+            current["content"] += line + "\n"
+    if current["content"]:
+        sections.append(current)
+    return sections
+
+
 def mongodb(url, doc, metadata=None):
     def generate_title_from_url(url: str) -> str:
         path = urlparse(url).path
@@ -174,6 +235,8 @@ def mongodb(url, doc, metadata=None):
         return os.path.splitext(name)[0].title()
 
     if check_pdf_extension(url):
+        sections = extract_sections_from_text(doc)
+        tables = extract_tables_from_pdf_text(doc)
         pdf_document = {
                 "content": doc,
                 "metadata": {
@@ -181,7 +244,9 @@ def mongodb(url, doc, metadata=None):
                     "doc_type": "pdf",
                     "source": url,
                     "title": generate_title_from_filename(url),
-                    "timestamp": datetime.datetime.now(datetime.UTC)
+                    "timestamp": datetime.datetime.now(datetime.UTC),
+                    "sections": sections,
+                    "tables": tables
                 }
             }
         # insert pdf into mongodb
@@ -199,13 +264,21 @@ def mongodb(url, doc, metadata=None):
     
     else:
         # insert web articles into mongodb
+        try:
+            soup = BeautifulSoup(doc.page_content, "html.parser")
+            html_text = soup.get_text("\n")
+            sections = extract_sections_from_text(html_text)
+        except Exception:
+            sections = []
+
         insert_docu = {
             "content": doc.page_content,
             "metadata": {
                 "source": url,
                 "title": generate_title_from_url(url),
                 "doc_type": "webpage",
-                "timestamp": datetime.datetime.now(datetime.UTC)
+                "timestamp": datetime.datetime.now(datetime.UTC),
+                "sections": sections
             }
         }
         existing_doc = mycol.find_one({"metadata.source": insert_docu["metadata"]["source"]})
@@ -219,13 +292,64 @@ def mongodb(url, doc, metadata=None):
             mycol.insert_one(insert_docu)
 
 
+def sanitize_text(text):
+        # Normalize and strip surrogates
+        if isinstance(text, str):
+            # Encode with surrogatepass to catch lone surrogates
+            return text.encode('utf-8', 'surrogatepass').decode('utf-8', 'ignore')
+        return text
+
+
+def read_pdf_with_fitz(source):
+    """
+    Read local or online PDF using PyMuPDF (fitz).
+    Returns full text and basic metadata.
+    """
+    def is_url(path):
+        return urlparse(path).scheme in ("http", "https")
+
+    try:
+        source = sanitize_text(source)
+    except Exception as e:
+        print(f"Failed to sanitize source path: {e}")
+        raise
+
+    # Load PDF from local or URL
+    try:
+        if is_url(source):
+            response = requests.get(source)
+            pdf_bytes = io.BytesIO(response.content)
+            doc = fitz.open("pdf", pdf_bytes)
+        else:
+            doc = fitz.open(source)
+    except Exception as e:
+        print(f"Failed to open PDF: {repr(source)} | {e}")
+        raise
+
+    # Extract full text
+    full_text = ""
+    for page in doc:
+        text = page.get_text()
+        text = sanitize_text(text)
+        full_text += text
+
+    # Extract simple metadata
+    metadata = doc.metadata or {}
+    metadata_clean = {k: sanitize_text(v) for k, v in metadata.items()}
+    return full_text, metadata_clean
+
+
 def search_load_data(online_data_sources, local_pdf_database):
     with open(online_data_sources, "r") as file:
-        # lines = file.readlines()
         web_sources = [line.strip() for line in file.readlines() if line.strip()]
 
     pdf_sources = glob.glob(os.path.join(local_pdf_database, "*.pdf"))
-    lines = web_sources + pdf_sources    
+
+    if source_filter == None:
+        lines = web_sources + pdf_sources    
+    else:
+        # The line below is used to load those in case not successfully loaded at the beginning
+        lines = source_filter
 
     for line in lines:     
         if not check_pdf_extension(line): # Load web articles
@@ -247,15 +371,16 @@ def search_load_data(online_data_sources, local_pdf_database):
                 continue 
             
             try:
-                loader = PyPDFLoader(line) # Load pdf files local or online
-                async def load_pages():
-                    pages = []
-                    async for page in loader.alazy_load():
-                        pages.append(page)
-                    return pages
-                pages = asyncio.run(load_pages())
-                doc = "\n".join([p.page_content for p in pages])
-                metadata = pages[0].metadata if pages else {}
+                # loader = PyPDFLoader(line) # Load pdf files local or online
+                # async def load_pages():
+                #     pages = []
+                #     async for page in loader.alazy_load():
+                #         pages.append(page)
+                #     return pages
+                # pages = asyncio.run(load_pages())
+                # doc = "\n".join([p.page_content for p in pages])
+                # metadata = pages[0].metadata if pages else {}
+                doc, metadata = read_pdf_with_fitz(line)
                 mongodb(line, doc, metadata)
             except Exception as e:
                 print(f"Error loading {line}: {e}")
@@ -275,22 +400,34 @@ def text_split_embedding(start_date, end_date):
     
     results = data_retrieval_by_time_mongodb(start_date, end_date)
 
+    # ✅ Filter by metadata.source if source_filter is specified, filter is used just for testing
+    filtered_results = []
+    for doc in results:
+        source = doc.get("metadata", {}).get("source", "")
+        if source_filter is None or source in source_filter:
+            filtered_results.append(doc)
+
+    if not filtered_results:
+        st.warning(f"No documents matched source_filter='{source_filter}' in the given date range.")
+        return [], []
+
     # Convert to Langchain format
     langchain_documents = [
         Document(
             page_content=doc["content"],
             metadata=doc.get("metadata", {})
-        ) for doc in results
+        ) for doc in filtered_results
     ]
     
     # Splitting
     splitter = RecursiveCharacterTextSplitter(
-        chunk_size=500,
-        chunk_overlap=50
+        chunk_size=1000,
+        chunk_overlap=150
     )
 
     split_docs = splitter.split_documents(langchain_documents)
- 
+    st.write(f"Text splitting is completed!")
+
     # Embedding
     hf = text_embedding_model_()
     texts = [doc.page_content for doc in split_docs]
@@ -321,7 +458,7 @@ def weaviate_data_query(start_date, end_date):
                 )
             ]
         )
-    
+
     split_docs, text_embeddings = text_split_embedding(start_date, end_date)
 
     # is_valid_query used to avoid stop words error
@@ -382,6 +519,7 @@ def data_processing(start_date, end_date):
     weaviate_data_query(start_date, end_date)
     st.write("Data update successfully completed!")
 
+
 def question_and_answers(query_question, conversation_history):
     def gemini_model(model_name, api_key):
         # Configure the API
@@ -404,40 +542,68 @@ def question_and_answers(query_question, conversation_history):
         hf = text_embedding_model_()
         query_vector = hf.embed_query(combined_query)
         collection = weaviate_client.collections.get(weaviate_collection_name)
-        results = collection.query.near_vector(query_vector, limit=near_vector_limit)
-        retrieved_chunks = [obj.properties["content"] for obj in results.objects]
+        # results = collection.query.near_vector(query_vector, limit=near_vector_limit)
+        results = collection.query.hybrid(
+                            query=query_question,           # 🔴 Keyword query
+                            vector=query_vector,            # 🔴 Semantic vector
+                            alpha=.8,                      # 🔴 Hybrid balance: 0=keyword only, 1=vector only
+                            limit=near_vector_limit    
+                        )
+        all_chunks = [obj.properties["content"] for obj in results.objects]
 
-        # Gemini prompt
+        # Reranking using Gemini
+        rerank_prompt = f"Rank the following text chunks by how well they answer the question.\n\nQuestion: {query_question}\n\n"
+        for i, chunk in enumerate(all_chunks):
+            snippet = chunk.strip().replace("\n", " ")
+            rerank_prompt += f"[{i}] {snippet[:300]}...\n\n"
+
+        rerank_prompt += "Return the top 5 chunk indices in descending order of relevance. Format: [3, 0, 2, 1, 4]"
+
+        # Gemini call for reranking
+        rerank_response = model.generate_content([{"role": "user", "parts": [rerank_prompt]}])
+        match = re.search(r"\[.*?\]", rerank_response.text)
+
+        if match:
+            try:
+                top_indices = eval(match.group(0))  # ⚠️ Safe only if you fully trust the model output
+            except Exception:
+                top_indices = list(range(top_k_matching_vector))
+        else:
+            top_indices = list(range(top_k_matching_vector))  # fallback
+
+        retrieved_chunks = [all_chunks[i] for i in top_indices]
+
+        # context
         context = "\n".join(retrieved_chunks)
+        st.write(context)
 
         # Build previous turns into the prompt
         history_text = ""
-        for user_q, assistant_a in conversation_history[-3:]:  # limit to last 3 turns
+        for user_q, assistant_a in conversation_history[-6:]:  # limit to last 3 turns
             history_text += f"User: {user_q}\nAssistant: {assistant_a}\n"
 
+        # Gemini prompt
         prompt = f"""
-        Use the provided context and your own general knowledge to answer the question. 
+        You are a helpful assistant. Use the provided context and your own general knowledge to answer the question. 
         If the context contains relevant details, combine it with your own general knowledge to provide the best answer. 
         If the context is missing details, supplement them using your own training and knowledge.
         Also, the user may ask follow-up questions that depend on earlier conversation. 
         Use the "Conversation History" below to maintain continuity and resolve such questions.
-        Be sure you are able to search, reason, and summarize information from different documents for the same company and site.
 
-        Current question:
-        {query_question}, not just based on context but on your general knowledge
+        === Question ===
+        {query_question}
 
-        Here's the Context:
+        === Context ===
         {context}
 
-        Conversion history:
+        === Conversation History ===
         {history_text}
 
         Answer:"""
 
-        # response = model.generate_content(prompt)
         response = model.generate_content([{"role": "user", "parts": [prompt]}])
-
         return response.text
+    
     return question_query(query_question, conversation_history)
 
 
