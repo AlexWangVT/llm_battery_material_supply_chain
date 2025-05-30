@@ -552,6 +552,7 @@ def question_and_answers(query_question, conversation_history):
         retrieved_chunks = [obj.properties["content"] for obj in results.objects]
 
 #################################################################################################################################
+        ## This part is used to rank the retrived chunk when chunk size is big, but there is some issue for the ranking results
         # # Reranking using Gemini
         # rerank_prompt = f"Rank the following text chunks by how well they answer the question.\n\nQuestion: {query_question}\n\n"
         # for i, chunk in enumerate(all_chunks):
