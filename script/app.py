@@ -549,30 +549,32 @@ def question_and_answers(query_question, conversation_history):
                             alpha=.8,                      # 🔴 Hybrid balance: 0=keyword only, 1=vector only
                             limit=near_vector_limit    
                         )
-        all_chunks = [obj.properties["content"] for obj in results.objects]
+        retrieved_chunks = [obj.properties["content"] for obj in results.objects]
 
-        # Reranking using Gemini
-        rerank_prompt = f"Rank the following text chunks by how well they answer the question.\n\nQuestion: {query_question}\n\n"
-        for i, chunk in enumerate(all_chunks):
-            snippet = chunk.strip().replace("\n", " ")
-            rerank_prompt += f"[{i}] {snippet[:300]}...\n\n"
+#################################################################################################################################
+        # # Reranking using Gemini
+        # rerank_prompt = f"Rank the following text chunks by how well they answer the question.\n\nQuestion: {query_question}\n\n"
+        # for i, chunk in enumerate(all_chunks):
+        #     snippet = chunk.strip().replace("\n", " ")
+        #     rerank_prompt += f"[{i}] {snippet[:300]}...\n\n"
 
-        rerank_prompt += "Return the top 5 chunk indices in descending order of relevance. Format: [3, 0, 2, 1, 4]"
+        # rerank_prompt += "Return the top 5 chunk indices in descending order of relevance. Format: [3, 0, 2, 1, 4]"
 
-        # Gemini call for reranking
-        rerank_response = model.generate_content([{"role": "user", "parts": [rerank_prompt]}])
-        match = re.search(r"\[.*?\]", rerank_response.text)
+        # # Gemini call for reranking
+        # rerank_response = model.generate_content([{"role": "user", "parts": [rerank_prompt]}])
+        # match = re.search(r"\[.*?\]", rerank_response.text)
 
-        if match:
-            try:
-                top_indices = eval(match.group(0))  # ⚠️ Safe only if you fully trust the model output
-            except Exception:
-                top_indices = list(range(top_k_matching_vector))
-        else:
-            top_indices = list(range(top_k_matching_vector))  # fallback
+        # if match:
+        #     try:
+        #         top_indices = eval(match.group(0))  # ⚠️ Safe only if you fully trust the model output
+        #     except Exception:
+        #         top_indices = list(range(top_k_matching_vector))
+        # else:
+        #     top_indices = list(range(top_k_matching_vector))  # fallback
 
-        retrieved_chunks = [all_chunks[i] for i in top_indices]
-
+        # retrieved_chunks = [all_chunks[i] for i in top_indices]
+#################################################################################################################################
+        
         # context
         context = "\n".join(retrieved_chunks)
         st.write(context)
@@ -584,14 +586,20 @@ def question_and_answers(query_question, conversation_history):
 
         # Gemini prompt
         prompt = f"""
-        You are a helpful assistant. Use the provided context and your own general knowledge to answer the question. 
-        If the context contains relevant details, combine it with your own general knowledge to provide the best answer. 
-        If the context is missing details, supplement them using your own training and knowledge.
-        Also, the user may ask follow-up questions that depend on earlier conversation. 
-        Use the "Conversation History" below to maintain continuity and resolve such questions.
+        You are a smart assistant helping the user answer questions.
 
+        The user has provided a **question**, **relevant context**, and **previous conversation**. Your job is to give a complete, accurate, and helpful answer.
+
+        If the context below contains relevant information, use it.  
+        If it's missing or incomplete, use your own general knowledge and **clearly indicate** that you're doing so.
+
+        Always explain your answer and avoid just restating the context.
+
+        The user may ask follow-up questions that depend on earlier conversation. 
+        Use the "Conversation History" below to maintain continuity and resolve such questions.
+        
         === Question ===
-        {query_question}
+        {query_question} based on both your own general knowledge and context information
 
         === Context ===
         {context}
