@@ -1,3 +1,5 @@
 /.venv3.12
 .env
 /script/*.yml
+/presentation
+/data_sources

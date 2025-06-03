@@ -6,7 +6,7 @@ import types
 
 # Create a fake module path to prevent Streamlit from trying to inspect torch.classes
 import torch
-
+import time
 # Monkey-patch torch.classes to trick Streamlit's watcher
 if not hasattr(torch.classes, "__path__"):
     torch.classes.__path__ = []
@@ -22,10 +22,12 @@ os.environ["USER_AGENT"] = "battery_materials_supply_chain_app" # set up USER_AG
 import glob
 import atexit
 import yaml
+import json
 import nltk
 import fitz  # PyMuPDF for better PDF parsing
 import io
 import re
+import spacy   # 
 import string
 import datetime
 import requests
@@ -37,7 +39,9 @@ import unicodedata
 from uuid import uuid4
 import streamlit as st
 from bs4 import BeautifulSoup 
+from datetime import timedelta
 import weaviate.classes as wvc
+from collections import Counter    #
 from nltk.corpus import stopwords
 import google.generativeai as genai
 from weaviate.classes.query import Filter
@@ -108,21 +112,24 @@ chinese_stopwords = {"的", "了", "和", "是", "我", "不", "在", "有", "�
                     "很", "太", "非常", "极", "极其", "相当", "几乎", "大约", "差不多", "差不多", "左右", "大概", "大约", "约", "将近",
                     "几", "些", "每", "所有", "全部", "一切", "任何", "某", "某些", "某个", "某些", "某种", "某些", "某类", "某种",
                     "其", "其余", "其余的", "其余的", "其他", "其他的", "其他人"}
-near_vector_limit = 30
-top_k_matching_vector = 10
-source_filter = None
-# ["../data_sources/local_pdfs/凯金——转让.pdf", "../data_sources/local_pdfs/贝特瑞-年度报告2023.pdf"] # This is used for testing purpose when we do not want to process all data, if all data need process, it equals None
+
+CONVERSATION_HISTORY_FILE = '../data_sources/history.json'
+conversation_history_turn_limit = -6
+near_vector_limit = 10
+# source_filter = None
+# source_filter = ["../data_sources/local_pdfs/凯金——转让.pdf"] # This is used for testing purpose when we do not want to process all data, if all data need process, it equals None
+source_filter =["https://www.itechminerals.com.au/projects/campoona-graphite-project/", "https://www.itechminerals.com.au/projects/campoona-graphite-project/#elementor-action%3Aaction%3Dpopup%3Aclose%26settings%3DeyJkb19ub3Rfc2hvd19hZ2FpbiI6IiJ9"]
 
 def text_embedding_model_():      
-        model_name = text_embedding_model
-        model_kwargs = text_embedding_model_kwargs
-        encode_kwargs = {'normalize_embeddings': True}
-        hf = HuggingFaceEmbeddings(
-            model_name=model_name,
-            model_kwargs=model_kwargs,
-            encode_kwargs=encode_kwargs
-        )
-        return hf
+    model_name = text_embedding_model
+    model_kwargs = text_embedding_model_kwargs
+    encode_kwargs = {'normalize_embeddings': True}
+    hf = HuggingFaceEmbeddings(
+        model_name=model_name,
+        model_kwargs=model_kwargs,
+        encode_kwargs=encode_kwargs
+    )
+    return hf
 
 
 def crawl_nested_tabs(url, base_url, visited, max_depth, depth=0):
@@ -237,13 +244,14 @@ def mongodb(url, doc, metadata=None):
     if check_pdf_extension(url):
         sections = extract_sections_from_text(doc)
         tables = extract_tables_from_pdf_text(doc)
+        title = generate_title_from_filename(url)
         pdf_document = {
                 "content": doc,
                 "metadata": {
                     **(metadata or {}),
                     "doc_type": "pdf",
                     "source": url,
-                    "title": generate_title_from_filename(url),
+                    "title": title,
                     "timestamp": datetime.datetime.now(datetime.UTC),
                     "sections": sections,
                     "tables": tables
@@ -271,11 +279,12 @@ def mongodb(url, doc, metadata=None):
         except Exception:
             sections = []
 
+        title = generate_title_from_url(url)
         insert_docu = {
             "content": doc.page_content,
             "metadata": {
                 "source": url,
-                "title": generate_title_from_url(url),
+                "title": title,
                 "doc_type": "webpage",
                 "timestamp": datetime.datetime.now(datetime.UTC),
                 "sections": sections
@@ -292,14 +301,6 @@ def mongodb(url, doc, metadata=None):
             mycol.insert_one(insert_docu)
 
 
-def sanitize_text(text):
-        # Normalize and strip surrogates
-        if isinstance(text, str):
-            # Encode with surrogatepass to catch lone surrogates
-            return text.encode('utf-8', 'surrogatepass').decode('utf-8', 'ignore')
-        return text
-
-
 def read_pdf_with_fitz(source):
     """
     Read local or online PDF using PyMuPDF (fitz).
@@ -308,6 +309,13 @@ def read_pdf_with_fitz(source):
     def is_url(path):
         return urlparse(path).scheme in ("http", "https")
 
+    def sanitize_text(text):
+        # Normalize and strip surrogates
+        if isinstance(text, str):
+            # Encode with surrogatepass to catch lone surrogates
+            return text.encode('utf-8', 'surrogatepass').decode('utf-8', 'ignore')
+        return text
+    
     try:
         source = sanitize_text(source)
     except Exception as e:
@@ -371,15 +379,6 @@ def search_load_data(online_data_sources, local_pdf_database):
                 continue 
             
             try:
-                # loader = PyPDFLoader(line) # Load pdf files local or online
-                # async def load_pages():
-                #     pages = []
-                #     async for page in loader.alazy_load():
-                #         pages.append(page)
-                #     return pages
-                # pages = asyncio.run(load_pages())
-                # doc = "\n".join([p.page_content for p in pages])
-                # metadata = pages[0].metadata if pages else {}
                 doc, metadata = read_pdf_with_fitz(line)
                 mongodb(line, doc, metadata)
             except Exception as e:
@@ -410,34 +409,37 @@ def text_split_embedding(start_date, end_date):
     if not filtered_results:
         st.warning(f"No documents matched source_filter='{source_filter}' in the given date range.")
         return [], []
-
-    # Convert to Langchain format
-    langchain_documents = [
-        Document(
-            page_content=doc["content"],
-            metadata=doc.get("metadata", {})
-        ) for doc in filtered_results
-    ]
     
-    # Splitting
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1000,
-        chunk_overlap=150
-    )
+    # Define two splitters for webpage and pdf, with different chunk size and overlap
+    webpage_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=100)
+    pdf_splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=150)
 
-    split_docs = splitter.split_documents(langchain_documents)
-    st.write(f"Text splitting is completed!")
+    split_docs = []
+
+    for doc in filtered_results:
+        # Detect doc type
+        doc_type = doc.get("metadata", {}).get("doc_type", "webpage")  # default to webpage if not specified
+
+        langchain_documents = Document(page_content=doc["content"], metadata=doc.get("metadata", {}))
+
+        if doc_type == "pdf":
+            chunks = pdf_splitter.split_documents([langchain_documents])
+        else:
+            chunks = webpage_splitter.split_documents([langchain_documents])
+
+        split_docs.extend(chunks)
+
+    st.write(f"Text splitting is completed! Total chunks: {len(split_docs)}")
 
     # Embedding
     hf = text_embedding_model_()
     texts = [doc.page_content for doc in split_docs]
     text_embeddings = hf.embed_documents(texts)
-    st.write("embedding is complete!")
+    st.write(f"Text embedding is completed! Total chunks: {len(text_embeddings)}")
     return split_docs, text_embeddings
 
 
 def weaviate_data_query(start_date, end_date):
-
     # Check if collection/class already exists, create one if not exists
     existing_collections = weaviate_client.collections.list_all()
     if weaviate_collection_name not in existing_collections:
@@ -455,6 +457,10 @@ def weaviate_data_query(start_date, end_date):
                 wvc.config.Property(
                     name="timestamp",
                     data_type=wvc.config.DataType.DATE,
+                ),
+                wvc.config.Property( 
+                    name="title",
+                    data_type=wvc.config.DataType.TEXT,
                 )
             ]
         )
@@ -477,7 +483,7 @@ def weaviate_data_query(start_date, end_date):
         print(f"✅ is_valid_query result: {is_valid}")
         return is_valid
     
-        # Store documents and vectors
+    # Store documents and vectors in Weaviate
     for doc, vector in zip(split_docs, text_embeddings):
         if not is_valid_query(doc.page_content):
             print((f"⚠️ Skipped doc: Only stopwords or too short.\nContent: {doc.page_content[:200]}"))
@@ -502,14 +508,21 @@ def weaviate_data_query(start_date, end_date):
                     print("Similar vector exists. No action taken.")
                 else:
                     # Insert new object
+                    metadata = doc.metadata or {}
+                    properties = {
+                        "content": doc.page_content,
+                        "source": metadata.get("source", ""),
+                        "title": metadata.get("title", ""),
+                        "timestamp": metadata.get("timestamp", "")
+                    }
                     weaviate_client.collections.get("Supply_chain_material").data.insert(
-                        properties={"content": doc.page_content},
+                        properties=properties,
                         vector=vector,
                         uuid = uuid4()
                     )
-                    print("Insert new data successfully!")
+                    print(f"Successfully insert {metadata.get("source", "")} in Weaviate!")
         except Exception as e:
-            print(f"⚠️ Problematic content: {doc.page_content}")
+            print(f"❌ Exception occurred: {e}")
     st.write("Data successfully stored in Weaviate!")
     
 
@@ -520,100 +533,85 @@ def data_processing(start_date, end_date):
     st.write("Data update successfully completed!")
 
 
-def question_and_answers(query_question, conversation_history):
-    def gemini_model(model_name, api_key):
-        # Configure the API
-        genai.configure(api_key = api_key)
-        # Load the Gemini model
-        gmodel = genai.GenerativeModel(model_name)
-        return gmodel
+def llm(model_name, api_key):
+    # Configure the API
+    genai.configure(api_key = api_key)
+    # Load the Gemini model
+    gmodel = genai.GenerativeModel(model_name)
+    return gmodel
 
 
-    def question_query(query_question, conversation_history):   
-        
-        model = gemini_model(gemini_model_name, google_api_key)
-        # Ask a question
-        if conversation_history:
-            last_question = conversation_history[-1][0]
-            combined_query = last_question + " " + query_question
-        else:
-            combined_query = query_question
+def question_and_answers(query_question, conversation_history): 
+    model = llm(gemini_model_name, google_api_key)
+    # Ask a question
+    if conversation_history:
+        last_question = conversation_history[-1][0]
+        combined_query = last_question + " " + query_question
+    else:
+        combined_query = query_question
 
-        hf = text_embedding_model_()
-        query_vector = hf.embed_query(combined_query)
-        collection = weaviate_client.collections.get(weaviate_collection_name)
-        # results = collection.query.near_vector(query_vector, limit=near_vector_limit)
-        results = collection.query.hybrid(
-                            query=query_question,           # 🔴 Keyword query
-                            vector=query_vector,            # 🔴 Semantic vector
-                            alpha=.8,                      # 🔴 Hybrid balance: 0=keyword only, 1=vector only
-                            limit=near_vector_limit    
-                        )
-        retrieved_chunks = [obj.properties["content"] for obj in results.objects]
-
-#################################################################################################################################
-        ## This part is used to rank the retrived chunk when chunk size is big, but there is some issue for the ranking results
-        # # Reranking using Gemini
-        # rerank_prompt = f"Rank the following text chunks by how well they answer the question.\n\nQuestion: {query_question}\n\n"
-        # for i, chunk in enumerate(all_chunks):
-        #     snippet = chunk.strip().replace("\n", " ")
-        #     rerank_prompt += f"[{i}] {snippet[:300]}...\n\n"
-
-        # rerank_prompt += "Return the top 5 chunk indices in descending order of relevance. Format: [3, 0, 2, 1, 4]"
-
-        # # Gemini call for reranking
-        # rerank_response = model.generate_content([{"role": "user", "parts": [rerank_prompt]}])
-        # match = re.search(r"\[.*?\]", rerank_response.text)
-
-        # if match:
-        #     try:
-        #         top_indices = eval(match.group(0))  # ⚠️ Safe only if you fully trust the model output
-        #     except Exception:
-        #         top_indices = list(range(top_k_matching_vector))
-        # else:
-        #     top_indices = list(range(top_k_matching_vector))  # fallback
-
-        # retrieved_chunks = [all_chunks[i] for i in top_indices]
-#################################################################################################################################
-        
-        # context
-        context = "\n".join(retrieved_chunks)
-        st.write(context)
-
-        # Build previous turns into the prompt
-        history_text = ""
-        for user_q, assistant_a in conversation_history[-6:]:  # limit to last 3 turns
-            history_text += f"User: {user_q}\nAssistant: {assistant_a}\n"
-
-        # Gemini prompt
-        prompt = f"""
-        You are a smart assistant helping the user answer questions.
-
-        The user has provided a **question**, **relevant context**, and **previous conversation**. Your job is to give a complete, accurate, and helpful answer.
-
-        If the context below contains relevant information, use it.  
-        If it's missing or incomplete, use your own general knowledge and **clearly indicate** that you're doing so.
-
-        Always explain your answer and avoid just restating the context.
-
-        The user may ask follow-up questions that depend on earlier conversation. 
-        Use the "Conversation History" below to maintain continuity and resolve such questions.
-        
-        === Question ===
-        {query_question} based on both your own general knowledge and context information
-
-        === Context ===
-        {context}
-
-        === Conversation History ===
-        {history_text}
-
-        Answer:"""
-
-        response = model.generate_content([{"role": "user", "parts": [prompt]}])
-        return response.text
+    hf = text_embedding_model_()
+    query_vector = hf.embed_query(combined_query)
+    collection = weaviate_client.collections.get(weaviate_collection_name)
+    results = collection.query.hybrid(
+                        query=query_question,           # 🔴 Keyword query
+                        vector=query_vector,            # 🔴 Semantic vector
+                        alpha=.3,                      # 🔴 Hybrid balance: 0=keyword only, 1=vector only
+                        limit=near_vector_limit,
+                        return_properties=["content", "source", "timestamp", "title"]    
+                    )
     
-    return question_query(query_question, conversation_history)
+        # Retrieve and include metadata
+    retrieved_chunks = []
+    for obj in results.objects:
+        content = obj.properties.get("content", "")
+        source = obj.properties.get("source", "")
+        title = obj.properties.get("title", "")
+        formatted_metadata = f"Source: {source}\n\nTitle: {title}"
+        integrated_chunk = f"Metadata:\n{formatted_metadata}\n\nContent:\n{content}"
+        retrieved_chunks.append(integrated_chunk)
+
+    context = "\n\n".join(retrieved_chunks)
+    st.write(context)
+
+    # Build previous turns into the prompt
+    history_text = ""
+    for user_q, assistant_a in conversation_history[conversation_history_turn_limit:]:  # limit to last 6 turns
+        history_text += f"User: {user_q}\nAssistant: {assistant_a}\n"
+
+    # Gemini prompt
+    prompt = f"""
+    You are a smart expert assistant helping the user answer questions. You have access to:
+
+    1) Relevant Context: documents and metadata provided by the user.
+    2) Your own general knowledge and facts up to your knowledge cutoff.
+
+    For every answer, combine both sources **even if the context is sufficient.**
+    Use the format below:
+
+    ---
+    **From Context**: [Clearly indicate what you found in the context, cite metadata if possible.]
+
+    **From General Knowledge**: [Add background, facts, or reasoning based on your own knowledge.]
+    ---
+
+    Do not skip either section unless the question is purely factual with no context overlap.
+    
+    === Relevant Context ===
+    {context}
+
+    === Question ===
+    {query_question}
+
+    === Conversation History ===
+    {history_text}
+
+    Answer:"""
+    # Before each Gemini API call
+    time.sleep(4)  # wait 4 seconds to keep under 15 requests/min
+    response = model.generate_content([{"role": "user", "parts": [prompt]}])
+
+    return response.text
 
 
 def llm_finetune(start_date, end_date):
@@ -621,6 +619,29 @@ def llm_finetune(start_date, end_date):
 
 
 def main():
+    def save_history(history):
+        history = history[-MAX_TURNS:]
+        with open(CONVERSATION_HISTORY_FILE, "w") as f:
+            json.dump(history, f)
+
+    def load_history():
+        if not os.path.exists(CONVERSATION_HISTORY_FILE):
+            return []
+
+        # Auto-delete if file is older than allowed
+        file_modified = datetime.datetime.fromtimestamp(os.path.getmtime(CONVERSATION_HISTORY_FILE))
+        if datetime.datetime.now() - file_modified > timedelta(days=MAX_HISTORY_AGE_DAYS):
+            os.remove(CONVERSATION_HISTORY_FILE)
+            return []
+
+        try:
+            with open(CONVERSATION_HISTORY_FILE, "r") as f:
+                return json.load(f)
+        except json.JSONDecodeError:
+            return []
+    
+    MAX_HISTORY_AGE_DAYS = 7  # Auto-clear if file is older than this
+    MAX_TURNS = 50  # Keep only recent 50 Q&A pairs
     st.set_page_config(page_title="Battery Materials Q&A", layout="centered")
     st.title("🔋 Battery Materials Supply Chain")
 
@@ -657,10 +678,13 @@ def main():
     elif mode == "💬 Q&A Mode":
         st.subheader("Ask a Question")
         if "conversation_history" not in st.session_state:
-            st.session_state.conversation_history = []
+            st.session_state.conversation_history = load_history()
 
-        query = st.text_input("Enter your question")
-        if st.button("Get Answer"):
+        with st.form(key="qa_form", clear_on_submit=False):
+            query = st.text_input("Enter your question", key="query_input")
+            submitted = st.form_submit_button("Get Answer")
+
+        if submitted:
             if not query.strip():
                 st.warning("Please enter a question.")
             else:
@@ -668,6 +692,7 @@ def main():
                     try:
                         answers = question_and_answers(query, st.session_state.conversation_history)
                         st.session_state.conversation_history.append((query, answers))  # <-- Maintain conversation
+                        save_history(st.session_state.conversation_history)
                         st.markdown("### 🧠 Answer:")
                         st.write(answers or "Gemini returned no response.")
 

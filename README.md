@@ -42,6 +42,7 @@ volumes:
 ```
 
 ii. start Weaviate
+Go to where Weaviate is installed and input the following:
 ```
 sudo docker-compose up -d
 ```
