@@ -135,6 +135,7 @@ UI_GARBAGE_PATTERNS = [
     r"\s{2,}",  # multiple spaces
 ]
 
+web_search_max_depth = 2
 CONVERSATION_HISTORY_FILE = '../data_sources/history.json'
 conversation_history_turn_limit = -6
 near_vector_limit = 20
@@ -154,9 +155,9 @@ def text_embedding_model_():
     return hf
 
 
-def crawl_nested_tabs(url, base_url, visited, max_depth, depth=0):
+def crawl_nested_tabs(url, base_url, visited, web_search_max_depth, depth=0):
     
-    if url in visited or depth > max_depth:
+    if url in visited or depth > web_search_max_depth:
         return []
 
     visited.add(url)
@@ -177,7 +178,7 @@ def crawl_nested_tabs(url, base_url, visited, max_depth, depth=0):
 
     for link in links:
         if base_url in link:  # Stay within the domain
-            results += crawl_nested_tabs(link, base_url, visited, max_depth, depth + 1)
+            results += crawl_nested_tabs(link, base_url, visited, web_search_max_depth, depth + 1)
 
     return results
 
@@ -381,11 +382,14 @@ def search_load_data(online_data_sources, local_pdf_database):
         # The line below is used to load those in case not successfully loaded at the beginning
         lines = source_filter
 
-    for line in lines:     
+    for line in lines:
+        #########################
+            # Add script here to include company name for each "line", all sub-tabs under this "line" assumed to have the same company name
+
+        #########################     
         if not check_pdf_extension(line): # Load web articles
             visited = set()
-            max_depth = 2  # Prevents infinite loops
-            all_tabs = crawl_nested_tabs(line, line, visited, max_depth)
+            all_tabs = crawl_nested_tabs(line, line, visited, web_search_max_depth)
             for tab in all_tabs:
                 try: 
                     loader = WebBaseLoader(tab)
