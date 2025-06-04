@@ -503,6 +503,7 @@ def text_split_embedding(start_date, end_date):
 
 def weaviate_data_query(start_date, end_date):
     # Check if collection/class already exists, create one if not exists
+    # weaviate_client.collections.delete(weaviate_collection_name) # This is only used when you want to clean out and reset Weaviate database 
     existing_collections = weaviate_client.collections.list_all()
     if weaviate_collection_name not in existing_collections:
         questions = weaviate_client.collections.create(
@@ -781,6 +782,6 @@ def main():
                     st.error(f"⚠️ Error during finetuning: {e}")
 
     weaviate_client.close()
-    
+
 if __name__ == "__main__":
     main()
