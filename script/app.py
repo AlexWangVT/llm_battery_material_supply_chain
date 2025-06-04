@@ -112,13 +112,35 @@ chinese_stopwords = {"的", "了", "和", "是", "我", "不", "在", "有", "�
                     "很", "太", "非常", "极", "极其", "相当", "几乎", "大约", "差不多", "差不多", "左右", "大概", "大约", "约", "将近",
                     "几", "些", "每", "所有", "全部", "一切", "任何", "某", "某些", "某个", "某些", "某种", "某些", "某类", "某种",
                     "其", "其余", "其余的", "其余的", "其他", "其他的", "其他人"}
+UI_GARBAGE_PATTERNS = [
+    r"(?i)\bCAPTCHA\b",
+    r"(?i)(create account|have an account\? log in|sign up|log in|forgot your password\?|remember me)",
+    r"(?i)(you're all set!|thank you.*?registered.*?logged in|check your email for details|invalid password or account does not exist)",
+    r"(?i)(email address|password)",
+    r"(?i)(ok|back|close|cancel|submit|next|previous|×)",  # common UI buttons and close icon
+    r"(?i)(click here to unsubscribe|unsubscribe|subscribe now|subscribe to our newsletter|newsletter sign-up|newsletter)",
+    r"(?i)(privacy policy|terms of service|cookie policy|cookie consent|terms and conditions|disclaimer)",
+    r"(?i)(advertisement|ad closed by user|advertiser disclosure|advertise here|advertise)",
+    r"(?i)(powered by|powered by wordpress|site map|contact us|about us|careers|contact information)",
+    r"(?i)(loading\.{3,}|please wait|loading more posts|read more|continue reading|click here to read more)",
+    r"(?i)(all rights reserved|copyright \d{4}|© \d{4}.*|©\d{4}.*|© \d{4}.*|©\d{4}.*)",
+    r"(?i)(view more|related articles|related links|related posts|related products|you might also like)",
+    r"(?i)(share on (facebook|twitter|linkedin|email)|share this article|follow us on|follow @\w+)",
+    r"(?i)(error \d{3,4}|page \d+ of \d+|slide \d+ of \d+|posted on \w+ \d{1,2}, \d{4}|last updated on \w+ \d{1,2}, \d{4}|last modified on \w+ \d{1,2}, \d{4})",
+    r"(?i)(this post was sponsored by|this article was written by|this entry was posted in|leave a comment|comments are closed)",
+    r"(?i)(sidebar|footer|header|site navigation|homepage|navigation|skip to content)",
+    r"(?i)(page \d+|\n\d+\n)",  # standalone page numbers
+    r"\.{3,}",  # multiple dots like ...
+    r"[-_=]{3,}",  # multiple dashes/underscores
+    r"\s{2,}",  # multiple spaces
+]
 
 CONVERSATION_HISTORY_FILE = '../data_sources/history.json'
 conversation_history_turn_limit = -6
-near_vector_limit = 10
-# source_filter = None
+near_vector_limit = 20
+source_filter = None
 # source_filter = ["../data_sources/local_pdfs/凯金——转让.pdf"] # This is used for testing purpose when we do not want to process all data, if all data need process, it equals None
-source_filter =["https://www.itechminerals.com.au/projects/campoona-graphite-project/", "https://www.itechminerals.com.au/projects/campoona-graphite-project/#elementor-action%3Aaction%3Dpopup%3Aclose%26settings%3DeyJkb19ub3Rfc2hvd19hZ2FpbiI6IiJ9"]
+# source_filter =["https://www.itechminerals.com.au/projects/campoona-graphite-project/", "https://www.itechminerals.com.au/projects/campoona-graphite-project/#elementor-action%3Aaction%3Dpopup%3Aclose%26settings%3DeyJkb19ub3Rfc2hvd19hZ2FpbiI6IiJ9"]
 
 def text_embedding_model_():      
     model_name = text_embedding_model
@@ -397,6 +419,45 @@ def text_split_embedding(start_date, end_date):
         })
         return data
     
+
+    def clean_garbage_text(text: str) -> str:
+        for pattern in UI_GARBAGE_PATTERNS:
+            text = re.sub(pattern, '', text, flags=re.IGNORECASE)
+        # Remove excessive whitespace, repeated headers/footers (simple heuristic: lines repeated multiple times)
+        lines = text.split('\n')
+        line_counts = {}
+        for line in lines:
+            stripped = line.strip()
+            if stripped:
+                line_counts[stripped] = line_counts.get(stripped, 0) + 1
+        repeated_lines = {line for line, count in line_counts.items() if count > 3}
+        cleaned_lines = [line for line in lines if line.strip() not in repeated_lines]
+        text = '\n'.join(cleaned_lines)
+        # Remove page number patterns
+        text = re.sub(r'page \d+(\s*of\s*\d+)?', '', text, flags=re.IGNORECASE)
+        text = re.sub(r'\n\d+\n', '\n', text)  # standalone page numbers
+        
+        # Remove line separators and artifacts
+        text = re.sub(r'[-_=]{3,}', '', text)
+        text = re.sub(r'\.{3,}', '', text)
+        
+        # Remove multiple blank lines and excessive spaces
+        text = re.sub(r'\n{2,}', '\n', text)
+        text = re.sub(r'\s{2,}', ' ', text)
+        text = re.sub(r'\n+', '\n', text)
+
+        # Fix broken lines ending with incomplete words (optional heuristic)
+        text = re.sub(r"([a-z])\n([a-z])", r"\1 \2", text, flags=re.IGNORECASE)
+
+        # Remove centered headings alone on a line (title in the middle)
+        text = re.sub(r'\n\s{3,}[A-Z][^\n]+\n', '\n', text)
+
+        # Fix lone single-letter artifacts or broken suffixes (e.g., "s\n")
+        text = re.sub(r"(\w+)'s\s*\n", r"\1's ", text)
+
+        return text.strip()
+
+
     results = data_retrieval_by_time_mongodb(start_date, end_date)
 
     # ✅ Filter by metadata.source if source_filter is specified, filter is used just for testing
@@ -415,12 +476,13 @@ def text_split_embedding(start_date, end_date):
     pdf_splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=150)
 
     split_docs = []
-
     for doc in filtered_results:
+        raw_content = doc["content"]
+        cleaned_content = clean_garbage_text(raw_content)
+
         # Detect doc type
         doc_type = doc.get("metadata", {}).get("doc_type", "webpage")  # default to webpage if not specified
-
-        langchain_documents = Document(page_content=doc["content"], metadata=doc.get("metadata", {}))
+        langchain_documents = Document(page_content=cleaned_content, metadata=doc.get("metadata", {}))
 
         if doc_type == "pdf":
             chunks = pdf_splitter.split_documents([langchain_documents])
@@ -530,6 +592,7 @@ def data_processing(start_date, end_date):
     search_load_data(online_data_sources, local_pdf_database)
     st.write("Data search and load successfully completed!")
     weaviate_data_query(start_date, end_date)
+    mongoclient.close()
     st.write("Data update successfully completed!")
 
 
@@ -717,6 +780,7 @@ def main():
                 except Exception as e:
                     st.error(f"⚠️ Error during finetuning: {e}")
 
-
+    weaviate_client.close()
+    
 if __name__ == "__main__":
     main()
