@@ -37,7 +37,10 @@ import datetime
 import accelerate
 import unicodedata
 from uuid import uuid4
+from numpy import dot
+from numpy.linalg import norm
 import streamlit as st
+from typing import List, Tuple
 from bs4 import BeautifulSoup 
 from datetime import timedelta
 import weaviate.classes as wvc
@@ -50,6 +53,9 @@ from pymongo import MongoClient
 from datasets import Dataset
 from langchain.schema import Document
 from urllib.parse import urlparse, unquote, urljoin
+from langchain.prompts import PromptTemplate
+from langchain_core.runnables import RunnableSequence
+from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_community.vectorstores import Weaviate
 from weaviate.connect import ConnectionParams
 from langchain_community.document_loaders import WebBaseLoader
@@ -128,13 +134,16 @@ UI_GARBAGE_PATTERNS = [
     r"(?i)(share on (facebook|twitter|linkedin|email)|share this article|follow us on|follow @\w+)",
     r"(?i)(error \d{3,4}|page \d+ of \d+|slide \d+ of \d+|posted on \w+ \d{1,2}, \d{4}|last updated on \w+ \d{1,2}, \d{4}|last modified on \w+ \d{1,2}, \d{4})",
     r"(?i)(this post was sponsored by|this article was written by|this entry was posted in|leave a comment|comments are closed)",
-    r"(?i)(sidebar|footer|header|site navigation|homepage|navigation|skip to content)",
-    r"(?i)(page \d+|\n\d+\n)",  # standalone page numbers
+    r"(?i)(sidebar|footer|header|site navigation|homepage|navigation|skip to content)|^\s*confidential.*|^\s*(?:login|sign up|contact us)\s*$",
+    r"(?i)(page \d+|\n\d+\n)|^\d{1,3}",  # standalone page numbers
     r"\.{3,}",  # multiple dots like ...
     r"[-_=]{3,}",  # multiple dashes/underscores
     r"\s{2,}",  # multiple spaces
 ]
 
+pdf_chunk_max_token = 768
+web_chunk_max_token = 512
+chunk_overlapping = 100
 web_search_max_depth = 2
 CONVERSATION_HISTORY_FILE = '../data_sources/history.json'
 conversation_history_turn_limit = -6
@@ -142,17 +151,6 @@ near_vector_limit = 20
 source_filter = None
 # source_filter = ["../data_sources/local_pdfs/凯金——转让.pdf"] # This is used for testing purpose when we do not want to process all data, if all data need process, it equals None
 # source_filter =["https://www.itechminerals.com.au/projects/campoona-graphite-project/", "https://www.itechminerals.com.au/projects/campoona-graphite-project/#elementor-action%3Aaction%3Dpopup%3Aclose%26settings%3DeyJkb19ub3Rfc2hvd19hZ2FpbiI6IiJ9"]
-
-def text_embedding_model_():      
-    model_name = text_embedding_model
-    model_kwargs = text_embedding_model_kwargs
-    encode_kwargs = {'normalize_embeddings': True}
-    hf = HuggingFaceEmbeddings(
-        model_name=model_name,
-        model_kwargs=model_kwargs,
-        encode_kwargs=encode_kwargs
-    )
-    return hf
 
 
 def crawl_nested_tabs(url, base_url, visited, web_search_max_depth, depth=0):
@@ -412,7 +410,20 @@ def search_load_data(online_data_sources, local_pdf_database):
             st.write(f"Load PDF documents from {line} and store in MongoDB successfully!")
 
 
-def text_split_embedding(start_date, end_date):
+def text_embedding_model_():      
+    model_name = text_embedding_model
+    model_kwargs = text_embedding_model_kwargs
+    encode_kwargs = {'normalize_embeddings': True}
+    hf = HuggingFaceEmbeddings(
+        model_name=model_name,
+        model_kwargs=model_kwargs,
+        encode_kwargs=encode_kwargs
+    )
+    return hf
+
+
+def text_split_embedding(start_date, end_date, pdf_max_token, web_max_token, overlapping):
+
     def data_retrieval_by_time_mongodb(start_date, end_date):
         start_datetime = datetime.datetime.combine(start_date, datetime.time.min)
         end_datetime = datetime.datetime.combine(end_date, datetime.time.max)
@@ -422,7 +433,6 @@ def text_split_embedding(start_date, end_date):
             }   
         })
         return data
-    
 
     def clean_garbage_text(text: str) -> str:
         for pattern in UI_GARBAGE_PATTERNS:
@@ -461,9 +471,67 @@ def text_split_embedding(start_date, end_date):
 
         return text.strip()
 
+    def sentence_split(text: str) -> List[str]:
+        pattern = r'(?<=[。！？!?；;])|(?<=\.\s)|(?<=\?\s)|(?<=!\s)'  # basic punctuation-based split
+        sentences = re.split(pattern, text)
+        return [s.strip() for s in sentences if s.strip()]
+    
+    # Smart token-aware chunking
+    def token_chunk(text: str, max_tokens: int = 512, overlap: int = 100) -> List[str]:
+        sentences = sentence_split(text)
+        chunks = []
+        current_chunk = []
+        current_length = 0
+
+        for sentence in sentences:
+            token_len = len(tokenizer.tokenize(sentence))
+            if token_len > max_tokens:
+                if current_chunk:
+                    chunks.append(" ".join(current_chunk))  # Save current chunk first
+                chunks.append(sentence.strip())  # Save long sentence as its own chunk
+                current_chunk = []
+                current_length = 0
+                continue
+
+            if current_length + token_len > max_tokens:
+                chunks.append(" ".join(current_chunk))
+                # Start new chunk with overlap
+                if overlap > 0:
+                    overlap_sentences = []
+                    overlap_tokens = 0
+                    for s in reversed(current_chunk):
+                        t = len(tokenizer.tokenize(s))
+                        if overlap_tokens + t > overlap:
+                            break
+                        overlap_sentences.insert(0, s)
+                        overlap_tokens += t
+                    current_chunk = overlap_sentences
+                    current_length = overlap_tokens
+                else:
+                    current_chunk = []
+                    current_length = 0
+
+            current_chunk.append(sentence)
+            current_length += token_len
+
+        if current_chunk:
+            chunks.append(" ".join(current_chunk))
+
+        return chunks
+
+
+    def is_duplicate(chunk: str, seen_hashes: set) -> bool:
+        # Simple hash-based deduplication
+        h = hash(chunk.strip().lower())
+        if h in seen_hashes:
+            return True
+        seen_hashes.add(h)
+        return False
+
 
     results = data_retrieval_by_time_mongodb(start_date, end_date)
-
+    tokenizer = AutoTokenizer.from_pretrained(text_embedding_model)
+    
     # ✅ Filter by metadata.source if source_filter is specified, filter is used just for testing
     filtered_results = []
     for doc in results:
@@ -475,26 +543,38 @@ def text_split_embedding(start_date, end_date):
         st.warning(f"No documents matched source_filter='{source_filter}' in the given date range.")
         return [], []
     
-    # Define two splitters for webpage and pdf, with different chunk size and overlap
-    webpage_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=100)
-    pdf_splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=150)
+    ##############################################################################################
+    # # Define two splitters for webpage and pdf, with different chunk size and overlap
+    # webpage_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=100)
+    # pdf_splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=150)
 
+    # split_docs = []
+    # for doc in filtered_results:
+    #     raw_content = doc["content"]
+    #     cleaned_content = clean_garbage_text(raw_content)
+
+    #     # Detect doc type
+    #     doc_type = doc.get("metadata", {}).get("doc_type", "webpage")  # default to webpage if not specified
+    #     langchain_documents = Document(page_content=cleaned_content, metadata=doc.get("metadata", {}))
+
+    #     if doc_type == "pdf":
+    #         chunks = pdf_splitter.split_documents([langchain_documents])
+    #     else:
+    #         chunks = webpage_splitter.split_documents([langchain_documents])
+
+    #     split_docs.extend(chunks)
+##############################################################################################
     split_docs = []
+    seen_hashes = set()
     for doc in filtered_results:
-        raw_content = doc["content"]
-        cleaned_content = clean_garbage_text(raw_content)
-
-        # Detect doc type
-        doc_type = doc.get("metadata", {}).get("doc_type", "webpage")  # default to webpage if not specified
-        langchain_documents = Document(page_content=cleaned_content, metadata=doc.get("metadata", {}))
-
-        if doc_type == "pdf":
-            chunks = pdf_splitter.split_documents([langchain_documents])
-        else:
-            chunks = webpage_splitter.split_documents([langchain_documents])
-
-        split_docs.extend(chunks)
-
+        raw_text = doc.get("content", "")
+        cleaned = clean_garbage_text(raw_text)
+        chunks = token_chunk(cleaned, max_tokens=pdf_max_token if doc.get("metadata", {}).get("doc_type") == "pdf" else web_max_token, overlap=overlapping)
+        for chunk in chunks:
+            if is_duplicate(chunk, seen_hashes):  # Filter duplicate chunks
+                continue
+            split_docs.append(Document(page_content=chunk, metadata=doc.get("metadata", {})))
+    
     st.write(f"Text splitting is completed! Total chunks: {len(split_docs)}")
 
     # Embedding
@@ -505,7 +585,7 @@ def text_split_embedding(start_date, end_date):
     return split_docs, text_embeddings
 
 
-def weaviate_data_query(start_date, end_date):
+def weaviate_data_query(start_date, end_date, pdf_max_token, web_max_token, overlapping):
     # Check if collection/class already exists, create one if not exists
     # weaviate_client.collections.delete(weaviate_collection_name) # This is only used when you want to clean out and reset Weaviate database 
     existing_collections = weaviate_client.collections.list_all()
@@ -532,7 +612,7 @@ def weaviate_data_query(start_date, end_date):
             ]
         )
 
-    split_docs, text_embeddings = text_split_embedding(start_date, end_date)
+    split_docs, text_embeddings = text_split_embedding(start_date, end_date, pdf_max_token, web_max_token, overlapping)
 
     # is_valid_query used to avoid stop words error
     def is_valid_query(text: str) -> bool:
@@ -593,10 +673,10 @@ def weaviate_data_query(start_date, end_date):
     st.write("Data successfully stored in Weaviate!")
     
 
-def data_processing(start_date, end_date):
+def data_processing(start_date, end_date, pdf_max_token, web_max_token, overlapping):
     search_load_data(online_data_sources, local_pdf_database)
     st.write("Data search and load successfully completed!")
-    weaviate_data_query(start_date, end_date)
+    weaviate_data_query(start_date, end_date, pdf_max_token, web_max_token, overlapping)
     mongoclient.close()
     st.write("Data update successfully completed!")
 
@@ -609,27 +689,62 @@ def llm(model_name, api_key):
     return gmodel
 
 
+def rewrite_query(query: str) -> str:
+    # Prompt to rewrite vague or conversational queries
+    REWRITE_PROMPT = PromptTemplate.from_template("""
+                You are an assistant that rewrites user questions to improve semantic search performance in a technical RAG system.
+                                                  
+                Instructions:
+                - If the original question is in Chinese, rewrite it in Chinese.
+                - If the original question is in English, rewrite it in English.
+                - Make the query more specific, use complete language, and include any implied terms relevant to battery materials and the supply chain domain.
+
+                Original Question: "{query}"
+                Rewritten Search-Friendly Question:
+                """)
+    llm = ChatGoogleGenerativeAI(model=gemini_model_name, google_api_key=google_api_key, temperature=0)
+    rewrite_chain = REWRITE_PROMPT | llm
+
+    return rewrite_chain.invoke({"query": query}).content.strip()
+
+
 def question_and_answers(query_question, conversation_history): 
+    
+    def cosine_similarity(vec1, vec2):
+        return dot(vec1, vec2) / (norm(vec1) * norm(vec2))
+
+    def is_follow_up(prev_question: str, current_question: str, hf_embedding_model, threshold: float) -> bool:
+        vec1 = hf_embedding_model.embed_query(prev_question)
+        vec2 = hf_embedding_model.embed_query(current_question)
+        similarity = cosine_similarity(vec1, vec2)
+        return similarity >= threshold
+
     model = llm(gemini_model_name, google_api_key)
+    hf = text_embedding_model_()
+    
     # Ask a question
     if conversation_history:
         last_question = conversation_history[-1][0]
-        combined_query = last_question + " " + query_question
+        if is_follow_up(last_question, query_question, hf, threshold=0.6):  # 🔧 use combined only if follow-up
+            combined_query = last_question + " " + query_question
+        else:
+            combined_query = query_question
     else:
         combined_query = query_question
-
-    hf = text_embedding_model_()
-    query_vector = hf.embed_query(combined_query)
+    
+    rewritten_query = rewrite_query(combined_query)
+    # st.info(f"🔁 Rewritten Query: {rewritten_query}")
+    query_vector = hf.embed_query(rewritten_query)
     collection = weaviate_client.collections.get(weaviate_collection_name)
     results = collection.query.hybrid(
-                        query=query_question,           # 🔴 Keyword query
+                        query=rewritten_query,           # 🔴 Keyword query
                         vector=query_vector,            # 🔴 Semantic vector
                         alpha=.3,                      # 🔴 Hybrid balance: 0=keyword only, 1=vector only
                         limit=near_vector_limit,
                         return_properties=["content", "source", "timestamp", "title"]    
                     )
     
-        # Retrieve and include metadata
+    # Retrieve and include metadata
     retrieved_chunks = []
     for obj in results.objects:
         content = obj.properties.get("content", "")
@@ -640,46 +755,131 @@ def question_and_answers(query_question, conversation_history):
         retrieved_chunks.append(integrated_chunk)
 
     context = "\n\n".join(retrieved_chunks)
-    st.write(context)
+    # st.write(context)
 
     # Build previous turns into the prompt
     history_text = ""
     for user_q, assistant_a in conversation_history[conversation_history_turn_limit:]:  # limit to last 6 turns
         history_text += f"User: {user_q}\nAssistant: {assistant_a}\n"
 
-    # Gemini prompt
-    prompt = f"""
-    You are a smart expert assistant helping the user answer questions. You have access to:
+#####################################################################################
+    # Query with Refine strategy 
+    # First chunk
+    existing_answer = ""
+    for idx, chunk in enumerate(retrieved_chunks):
+        if idx == 0:
+            # Initial generation (include conversation history here)
+            prompt = f"""
+                    You are a smart expert assistant helping the user answer questions. You have access to:
 
-    1) Relevant Context: documents and metadata provided by the user.
-    2) Your own general knowledge and facts up to your knowledge cutoff.
+                    1) Relevant Context: documents and metadata provided by the user.
+                    2) Your own general knowledge and facts up to your knowledge cutoff.
 
-    For every answer, combine both sources **even if the context is sufficient.**
-    Use the format below:
+                    For every answer, combine both sources **even if the context is sufficient.**
+                    Use the format below:
 
-    ---
-    **From Context**: [Clearly indicate what you found in the context, cite metadata if possible.]
+                    ---
+                    **From Context**: [Clearly indicate what you found in the context, cite metadata if possible.]
 
-    **From General Knowledge**: [Add background, facts, or reasoning based on your own knowledge.]
-    ---
+                    **From General Knowledge**: [Add background, facts, or reasoning based on your own knowledge.]
+                    ---
 
-    Do not skip either section unless the question is purely factual with no context overlap.
+                    Do not skip either section unless the question is purely factual with no context overlap.
+                    
+                    === Relevant Context ===
+                    {chunk}
+
+                    === Question ===
+                    {query_question}
+
+                    === Conversation History ===
+                    {history_text}
+
+                    Answer:"""
+            time.sleep(4)
+            response = model.generate_content([{"role": "user", "parts": [prompt]}])
+            existing_answer = response.text.strip()
+        else:
+            # Include conversation history only on the final chunk
+            if idx == len(retrieved_chunks) - 1:
+                refine_prompt = f"""
+                            You are refining an answer based on new context and previous reasoning. Improve the previous answer if new context adds value.
+
+                            ---
+                            PREVIOUS ANSWER:
+                            {existing_answer}
+
+                            NEW CONTEXT:
+                            {chunk}
+
+                            CONVERSATION HISTORY:
+                            {history_text}
+
+                            QUESTION:
+                            {query_question}
+
+                            Only modify if new context provides additional information, corrections, or clarifications.
+                            ---
+
+                            Refined Answer:"""
+            else:
+                refine_prompt = f"""
+                            You are refining an answer based on new context and previous reasoning. Improve the previous answer if new context adds value.
+
+                            ---
+                            PREVIOUS ANSWER:
+                            {existing_answer}
+
+                            NEW CONTEXT:
+                            {chunk}
+
+                            QUESTION:
+                            {query_question}
+
+                            Only modify if new context provides additional information, corrections, or clarifications.
+                            ---
+
+                            Refined Answer:"""
+            
+            time.sleep(4)
+            response = model.generate_content([{"role": "user", "parts": [refine_prompt]}])
+            existing_answer = response.text.strip()
+
+    return existing_answer
+    #####################################################################################
+    # # Gemini prompt
+    # prompt = f"""
+    # You are a smart expert assistant helping the user answer questions. You have access to:
+
+    # 1) Relevant Context: documents and metadata provided by the user.
+    # 2) Your own general knowledge and facts up to your knowledge cutoff.
+
+    # For every answer, combine both sources **even if the context is sufficient.**
+    # Use the format below:
+    # ---
+    # **From Context**: [Clearly indicate what you found in the context, cite metadata if possible.]
+
+    # **From General Knowledge**: [Add background, facts, or reasoning based on your own knowledge.]
+    # ---
+
+    # Do not skip either section unless the question is purely factual with no context overlap.
     
-    === Relevant Context ===
-    {context}
+    # === Relevant Context ===
+    # {context}
 
-    === Question ===
-    {query_question}
+    # === Question ===
+    # {query_question}
 
-    === Conversation History ===
-    {history_text}
+    # === Conversation History ===
+    # {history_text}
 
-    Answer:"""
-    # Before each Gemini API call
-    time.sleep(4)  # wait 4 seconds to keep under 15 requests/min
-    response = model.generate_content([{"role": "user", "parts": [prompt]}])
+    # Answer:"""
 
-    return response.text
+    # # Before each Gemini API call
+    # time.sleep(4)  # wait 4 seconds to keep under 15 requests/min
+    # response = model.generate_content([{"role": "user", "parts": [prompt]}])
+
+    # return response.text.strip()
 
 
 def llm_finetune(start_date, end_date):
@@ -711,6 +911,7 @@ def main():
     MAX_HISTORY_AGE_DAYS = 7  # Auto-clear if file is older than this
     MAX_TURNS = 50  # Keep only recent 50 Q&A pairs
     st.set_page_config(page_title="Battery Materials Q&A", layout="centered")
+    
     st.title("🔋 Battery Materials Supply Chain")
 
     # Sidebar or top dropdown for selecting mode
@@ -739,7 +940,7 @@ def main():
         if st.button("Run Data Pipeline"):
             with st.spinner("Processing data..."):
                 try:
-                    data_processing(start_date, end_date)
+                    data_processing(start_date, end_date, pdf_chunk_max_token, web_chunk_max_token, chunk_overlapping)
                 except Exception as e:
                     st.error(f"⚠️ Error: {e}")
                     
@@ -758,6 +959,7 @@ def main():
             else:
                 with st.spinner("Querying the model..."):
                     try:
+                        # ✨ Rewrite the query before retrieval
                         answers = question_and_answers(query, st.session_state.conversation_history)
                         st.session_state.conversation_history.append((query, answers))  # <-- Maintain conversation
                         save_history(st.session_state.conversation_history)
