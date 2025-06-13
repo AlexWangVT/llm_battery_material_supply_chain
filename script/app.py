@@ -54,6 +54,7 @@ from datasets import Dataset
 from langchain.schema import Document
 from urllib.parse import urlparse, unquote, urljoin
 from langchain.prompts import PromptTemplate
+from sentence_transformers import CrossEncoder 
 from langchain_core.runnables import RunnableSequence
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_community.vectorstores import Weaviate
@@ -110,6 +111,7 @@ text_embedding_model = config["model"]["text_embedding_model"]
 text_embedding_model_kwargs = config["model"]["text_embedding_model_kwargs"]
 gemini_model_name = config["model"]["gemini_model"]
 llama_model_name = config["model"]["llama_model"]
+cross_encoder_model = config["model"]["cross_encoder"]
 english_stopwords = set(stopwords.words("english"))
 chinese_stopwords = {"的", "了", "和", "是", "我", "不", "在", "有", "就", "人", "都", "一", "一个", "上", "也", "很", "到", "说", "要",
                     "去", "你", "会", "着", "没有", "看", "好", "自己", "这", "那", "它", "他", "她", "我们", "你们", "他们", "她们",
@@ -147,7 +149,8 @@ chunk_overlapping = 100
 web_search_max_depth = 2
 CONVERSATION_HISTORY_FILE = '../data_sources/history.json'
 conversation_history_turn_limit = -6
-near_vector_limit = 20
+near_vector_limit = 100
+rerank_top_k_chunks = 20
 source_filter = None
 # source_filter = ["../data_sources/local_pdfs/凯金——转让.pdf"] # This is used for testing purpose when we do not want to process all data, if all data need process, it equals None
 # source_filter =["https://www.itechminerals.com.au/projects/campoona-graphite-project/", "https://www.itechminerals.com.au/projects/campoona-graphite-project/#elementor-action%3Aaction%3Dpopup%3Aclose%26settings%3DeyJkb19ub3Rfc2hvd19hZ2FpbiI6IiJ9"]
@@ -719,9 +722,39 @@ def question_and_answers(query_question, conversation_history):
         similarity = cosine_similarity(vec1, vec2)
         return similarity >= threshold
 
+    # --- VERIFICATION STEP ---
+    def verify_answer(query_question, answer, context):
+        verify_prompt = f"""
+            You are a helpful assistant whose job is to verify the correctness of answers.
+
+            Question:
+            {query_question}
+
+            Answer:
+            {answer}
+
+            Relevant Context:
+            {context}
+
+            Please do the following:
+
+            1. Verify whether the answer is correct, complete, and supported by the context.
+            2. Explain any issues, missing information, or inaccuracies if found.
+            3. Suggest specific next questions or follow-up steps the user could ask to get more complete or clearer information.
+
+            Provide your verification and suggestions clearly and concisely.
+
+            Verification:"""
+
+        verification_response = model.generate_content([{"role": "user", "parts": [verify_prompt]}])
+        verification = verification_response.text.strip()
+        return verification
+    # --- END VERIFICATION ---
+
     model = llm(gemini_model_name, google_api_key)
     hf = text_embedding_model_()
-    
+    cross_encoder = CrossEncoder(cross_encoder_model, device='cpu')
+
     # Ask a question
     if conversation_history:
         last_question = conversation_history[-1][0]
@@ -745,141 +778,159 @@ def question_and_answers(query_question, conversation_history):
                     )
     
     # Retrieve and include metadata
-    retrieved_chunks = []
+    raw_chunks = []
     for obj in results.objects:
         content = obj.properties.get("content", "")
         source = obj.properties.get("source", "")
         title = obj.properties.get("title", "")
         formatted_metadata = f"Source: {source}\n\nTitle: {title}"
-        integrated_chunk = f"Metadata:\n{formatted_metadata}\n\nContent:\n{content}"
-        retrieved_chunks.append(integrated_chunk)
+        raw_chunks.append({
+            "content": content,
+            "metadata": formatted_metadata,
+            "full": f"Metadata:\n{formatted_metadata}\n\nContent:\n{content}"
+        })
 
-    context = "\n\n".join(retrieved_chunks)
-    # st.write(context)
+    chunk_pairs = [(rewritten_query, chunk["content"]) for chunk in raw_chunks]
+    scores = cross_encoder.predict(chunk_pairs)
+    reranked_chunks = sorted(zip(raw_chunks, scores), key=lambda x: x[1], reverse=True)
+    top_chunks = [chunk["full"] for chunk, _ in reranked_chunks[:rerank_top_k_chunks]]  
+    context = "\n\n".join(top_chunks)
+    st.write(context)
 
     # Build previous turns into the prompt
     history_text = ""
     for user_q, assistant_a in conversation_history[conversation_history_turn_limit:]:  # limit to last 6 turns
         history_text += f"User: {user_q}\nAssistant: {assistant_a}\n"
 
-#####################################################################################
-    # Query with Refine strategy 
-    # First chunk
-    existing_answer = ""
-    for idx, chunk in enumerate(retrieved_chunks):
-        if idx == 0:
-            # Initial generation (include conversation history here)
-            prompt = f"""
-                    You are a smart expert assistant helping the user answer questions. You have access to:
+# #####################################################################################
+#     # Query with Refine strategy 
+#     # First chunk
+#     existing_answer = ""
+#     for idx, chunk in enumerate(retrieved_chunks):
+#         if idx == 0:
+#             # Initial generation (include conversation history here)
+#             prompt = f"""
+        # You are a smart expert assistant helping the user answer questions. You have access to:
 
-                    1) Relevant Context: documents and metadata provided by the user.
-                    2) Your own general knowledge and facts up to your knowledge cutoff.
+        # 1) Relevant Context: documents and metadata provided by the user.
+        # 2) Your own general knowledge and facts up to your knowledge cutoff.
 
-                    For every answer, combine both sources **even if the context is sufficient.**
-                    Use the format below:
+        # For every answer, combine both sources **even if the context is sufficient.**
+        # When analyzing the relevant context, carefully examine **both the content and the attached metadata** for each chunk.  
+        # Use the metadata to identify key entities such as company names, dates, locations, sources, titles, or other important details, and relate these to the information in the content.
 
-                    ---
-                    **From Context**: [Clearly indicate what you found in the context, cite metadata if possible.]
+        # Use the format below:
+        # ---
+        # **From Context**: [Clearly indicate what you found in the context, cite metadata if possible.]
 
-                    **From General Knowledge**: [Add background, facts, or reasoning based on your own knowledge.]
-                    ---
+        # **From General Knowledge**: [Add background, facts, or reasoning based on your own knowledge.]
+        # ---
 
-                    Do not skip either section unless the question is purely factual with no context overlap.
-                    
-                    === Relevant Context ===
-                    {chunk}
+        # Do not skip either section unless the question is purely factual with no context overlap.
 
-                    === Question ===
-                    {query_question}
+        # You may answer in English, Chinese, or both — choose whichever best conveys the information clearly and naturally, depending on the question and the context.
+        
+        # === Relevant Context ===
+        # {context}
 
-                    === Conversation History ===
-                    {history_text}
+        # === Question ===
+        # {query_question}
 
-                    Answer:"""
-            time.sleep(4)
-            response = model.generate_content([{"role": "user", "parts": [prompt]}])
-            existing_answer = response.text.strip()
-        else:
-            # Include conversation history only on the final chunk
-            if idx == len(retrieved_chunks) - 1:
-                refine_prompt = f"""
-                            You are refining an answer based on new context and previous reasoning. Improve the previous answer if new context adds value.
+        # === Conversation History ===
+        # {history_text}
 
-                            ---
-                            PREVIOUS ANSWER:
-                            {existing_answer}
+        # Answer:"""
+#             time.sleep(4)
+#             response = model.generate_content([{"role": "user", "parts": [prompt]}])
+#             existing_answer = response.text.strip()
+#         else:
+#             # Include conversation history only on the final chunk
+#             if idx == len(retrieved_chunks) - 1:
+#                 refine_prompt = f"""
+#                             You are refining an answer based on new context and previous reasoning. Improve the previous answer if new context adds value.
 
-                            NEW CONTEXT:
-                            {chunk}
+#                             ---
+#                             PREVIOUS ANSWER:
+#                             {existing_answer}
 
-                            CONVERSATION HISTORY:
-                            {history_text}
+#                             NEW CONTEXT:
+#                             {chunk}
 
-                            QUESTION:
-                            {query_question}
+#                             CONVERSATION HISTORY:
+#                             {history_text}
 
-                            Only modify if new context provides additional information, corrections, or clarifications.
-                            ---
+#                             QUESTION:
+#                             {query_question}
 
-                            Refined Answer:"""
-            else:
-                refine_prompt = f"""
-                            You are refining an answer based on new context and previous reasoning. Improve the previous answer if new context adds value.
+#                             Only modify if new context provides additional information, corrections, or clarifications.
+#                             ---
 
-                            ---
-                            PREVIOUS ANSWER:
-                            {existing_answer}
+#                             Refined Answer:"""
+#             else:
+#                 refine_prompt = f"""
+#                             You are refining an answer based on new context and previous reasoning. Improve the previous answer if new context adds value.
 
-                            NEW CONTEXT:
-                            {chunk}
+#                             ---
+#                             PREVIOUS ANSWER:
+#                             {existing_answer}
 
-                            QUESTION:
-                            {query_question}
+#                             NEW CONTEXT:
+#                             {chunk}
 
-                            Only modify if new context provides additional information, corrections, or clarifications.
-                            ---
+#                             QUESTION:
+#                             {query_question}
 
-                            Refined Answer:"""
+#                             Only modify if new context provides additional information, corrections, or clarifications.
+#                             ---
+
+#                             Refined Answer:"""
             
-            time.sleep(4)
-            response = model.generate_content([{"role": "user", "parts": [refine_prompt]}])
-            existing_answer = response.text.strip()
+#             time.sleep(4)
+#             response = model.generate_content([{"role": "user", "parts": [refine_prompt]}])
+#             existing_answer = response.text.strip()
+        # verification = verify_answer(query_question, existing_answer, context) # Verify after all chunks (more efficient)
+#     return existing_answer, verification
+#     #####################################################################################
+    # Gemini prompt
+    prompt = f"""
+        You are a smart expert assistant helping the user answer questions. You have access to:
 
-    return existing_answer
-    #####################################################################################
-    # # Gemini prompt
-    # prompt = f"""
-    # You are a smart expert assistant helping the user answer questions. You have access to:
+        1) Relevant Context: documents and metadata provided by the user.
+        2) Your own general knowledge and facts up to your knowledge cutoff.
 
-    # 1) Relevant Context: documents and metadata provided by the user.
-    # 2) Your own general knowledge and facts up to your knowledge cutoff.
+        For every answer, combine both sources **even if the context is sufficient.**
+        When analyzing the relevant context, carefully examine **both the content and the attached metadata** for each chunk.  
+        Use the metadata to identify key entities such as company names, dates, locations, sources, titles, or other important details, and relate these to the information in the content.
 
-    # For every answer, combine both sources **even if the context is sufficient.**
-    # Use the format below:
-    # ---
-    # **From Context**: [Clearly indicate what you found in the context, cite metadata if possible.]
+        Use the format below:
+        ---
+        **From Context**: [Clearly indicate what you found in the context, cite metadata if possible.]
 
-    # **From General Knowledge**: [Add background, facts, or reasoning based on your own knowledge.]
-    # ---
+        **From General Knowledge**: [Add background, facts, or reasoning based on your own knowledge.]
+        ---
 
-    # Do not skip either section unless the question is purely factual with no context overlap.
-    
-    # === Relevant Context ===
-    # {context}
+        Do not skip either section unless the question is purely factual with no context overlap.
 
-    # === Question ===
-    # {query_question}
+        You may answer in English, Chinese, or both — choose whichever best conveys the information clearly and naturally, depending on the question and the context.
+        
+        === Relevant Context ===
+        {context}
 
-    # === Conversation History ===
-    # {history_text}
+        === Question ===
+        {query_question}
 
-    # Answer:"""
+        === Conversation History ===
+        {history_text}
 
-    # # Before each Gemini API call
-    # time.sleep(4)  # wait 4 seconds to keep under 15 requests/min
-    # response = model.generate_content([{"role": "user", "parts": [prompt]}])
+        Answer:"""
 
-    # return response.text.strip()
+    # Before each Gemini API call
+    time.sleep(4)  # wait 4 seconds to keep under 15 requests/min
+    response = model.generate_content([{"role": "user", "parts": [prompt]}])
+    answer = response.text.strip() 
+    verification = verify_answer(query_question, answer, context)
+
+    return answer, verification
 
 
 def llm_finetune(start_date, end_date):
@@ -943,7 +994,7 @@ def main():
                     data_processing(start_date, end_date, pdf_chunk_max_token, web_chunk_max_token, chunk_overlapping)
                 except Exception as e:
                     st.error(f"⚠️ Error: {e}")
-                    
+    
     elif mode == "💬 Q&A Mode":
         st.subheader("Ask a Question")
         if "conversation_history" not in st.session_state:
@@ -959,12 +1010,17 @@ def main():
             else:
                 with st.spinner("Querying the model..."):
                     try:
+                        start_time = time.time()
                         # ✨ Rewrite the query before retrieval
-                        answers = question_and_answers(query, st.session_state.conversation_history)
+                        answers, verification = question_and_answers(query, st.session_state.conversation_history)
                         st.session_state.conversation_history.append((query, answers))  # <-- Maintain conversation
                         save_history(st.session_state.conversation_history)
+                        
+                        elapsed_time = time.time() - start_time
+                        st.markdown(f"⏱️ Runtime: **{elapsed_time:.2f} seconds**")
                         st.markdown("### 🧠 Answer:")
                         st.write(answers or "Gemini returned no response.")
+                        st.write(verification)
 
                         # Show chat history (optional)
                         with st.expander("🗂️ Conversation History"):
